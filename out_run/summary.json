@@ -1,0 +1,22 @@
+{
+  "total": 364,
+  "skipped": 0,
+  "failed_calls": 1,
+  "avg_latency_ms": 8516.810439560439,
+  "rule_accuracy": 0.5757575757575758,
+  "judge_accuracy": 0.0,
+  "timestamp_ms": 1765984246444,
+  "vpn": "on",
+  "proxy": "http://127.0.0.1:7897",
+  "cot": "on",
+  "model": {
+    "provider": "openai",
+    "base_url": "https://api.bltcy.ai",
+    "model": "gpt-5.1"
+  },
+  "judge_model": {
+    "provider": "openai",
+    "base_url": "https://api.bltcy.ai",
+    "model": "gpt-5.1"
+  }
+}

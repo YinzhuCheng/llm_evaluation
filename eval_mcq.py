@@ -1,0 +1,966 @@
+import argparse
+import asyncio
+import base64
+import json
+import os
+import random
+import re
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple, List
+
+import httpx
+import pandas as pd
+import yaml
+
+
+# ----------------------------
+# Utils
+# ----------------------------
+
+LETTER_RE = re.compile(r"\b([A-E])\b", re.IGNORECASE)
+# For COT mode: extract from a dedicated final line
+FINAL_ANSWER_RE = re.compile(r"(?im)^\s*(?:final\s*)?answer\s*[:：]\s*([A-E](?:\s*,\s*[A-E])*)\s*$")
+
+RETRIABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+def safe_jsonl_append(path: str, obj: Dict[str, Any]) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+def load_yaml_config(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+def normalize_colname(s: str) -> str:
+    return str(s).strip()
+
+def load_options(options_cell: Any) -> List[str]:
+    """
+    Expect JSON array string like ["A: ...", "B: ...", ...]
+    Robust parse with fallback.
+    """
+    if options_cell is None:
+        return []
+    if isinstance(options_cell, float) and pd.isna(options_cell):
+        return []
+    if isinstance(options_cell, list):
+        return [str(x) for x in options_cell]
+
+    s = str(options_cell).strip()
+    if not s:
+        return []
+    try:
+        v = json.loads(s)
+        if isinstance(v, list):
+            return [str(x) for x in v]
+    except Exception:
+        pass
+
+    # fallback split
+    parts = re.split(r"\s*\|\s*|\s*;\s*", s)
+    return [p.strip() for p in parts if p.strip()]
+
+def image_file_to_data_url(image_path: str) -> Optional[str]:
+    if not image_path or not os.path.exists(image_path):
+        return None
+
+    ext = os.path.splitext(image_path)[1].lower()
+    mime = "image/jpeg"
+    if ext == ".png":
+        mime = "image/png"
+    elif ext == ".webp":
+        mime = "image/webp"
+    elif ext in [".jpg", ".jpeg"]:
+        mime = "image/jpeg"
+
+    with open(image_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+def extract_letters_csv(text: str) -> Optional[str]:
+    """
+    Extract multiple answers from model output.
+    Return normalized CSV like 'A,B,C' (no spaces), unique letters in order of first appearance.
+    If none found, return None.
+    """
+    if not text:
+        return None
+    letters = LETTER_RE.findall(text.upper())
+    if not letters:
+        return None
+
+    seen = set()
+    uniq = []
+    for ch in letters:
+        ch = ch.upper()
+        if ch in ["A", "B", "C", "D", "E"] and ch not in seen:
+            uniq.append(ch)
+            seen.add(ch)
+
+    return ",".join(uniq) if uniq else None
+
+def normalize_csv_letters(s: str) -> str:
+    """
+    Normalize any text like 'A, B,C' or '答案是A和C' -> 'A,C'
+    Removes spaces, keeps unique A-E in first-appearance order.
+    """
+    if not s:
+        return ""
+    s = str(s).upper().replace(" ", "")
+    letters = re.findall(r"[A-E]", s)
+    seen = set()
+    uniq = []
+    for ch in letters:
+        if ch not in seen:
+            uniq.append(ch)
+            seen.add(ch)
+    return ",".join(uniq)
+
+def csv_to_set(s: str) -> set:
+    if not s:
+        return set()
+    parts = [p for p in s.split(",") if p]
+    return set(parts)
+
+def extract_answer_from_text(text: str, cot_on: bool) -> Optional[str]:
+    """
+    If cot_on=True, prefer extracting from a dedicated final line like:
+      Answer:A,B,C   (parser tolerates spaces around commas)
+    If not found, fallback to last non-empty line, then fallback to global extraction.
+    Return normalized CSV like 'A,B,C' or None.
+    """
+    if not text:
+        return None
+
+    if cot_on:
+        m = FINAL_ANSWER_RE.search(text)
+        if m:
+            norm = normalize_csv_letters(m.group(1))
+            return norm if norm else None
+
+        # fallback: try last non-empty line
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            last = lines[-1]
+            norm = normalize_csv_letters(last)
+            if norm:
+                return norm
+
+    raw = extract_letters_csv(text)
+    norm = normalize_csv_letters(raw or "")
+    return norm if norm else None
+
+
+# ----------------------------
+# Config
+# ----------------------------
+
+@dataclass
+class ProviderConfig:
+    provider: str  # openai | gemini | claude
+    base_url: str
+    api_key: str
+    model: str
+    timeout_s: float = 60.0
+    temperature: float = 0.0
+    max_tokens: int = 512
+
+@dataclass
+class RunConfig:
+    input_path: str
+    sheet_name: Optional[str]
+    images_root: str
+    out_dir: str
+    concurrency: int
+    max_retries: int
+    retry_base_delay_s: float
+    retry_max_delay_s: float
+    skip_image_missing: bool = True
+    limit: Optional[int] = None
+
+    # NEW: cot switch
+    cot: str = "off"  # on/off
+
+    # vpn/proxy switch
+    vpn: str = "off"       # on/off
+    proxy: str = ""        # proxy url, e.g. http://127.0.0.1:7897
+
+
+# ----------------------------
+# HTTP client & Retry
+# ----------------------------
+
+def make_async_client(run_cfg: RunConfig) -> httpx.AsyncClient:
+    """
+    vpn=off => direct (ignore env proxies)
+    vpn=on  => use proxy (explicit --proxy, otherwise default localhost:7897)
+    """
+    if run_cfg.vpn == "off":
+        return httpx.AsyncClient(trust_env=False)
+
+    proxy = run_cfg.proxy.strip()
+    if not proxy:
+        proxy = "http://127.0.0.1:7897"  # default
+        # socks5 example:
+        # proxy = "socks5://127.0.0.1:7897"
+
+    return httpx.AsyncClient(proxy=proxy, trust_env=False)
+
+async def request_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    json_payload: Dict[str, Any],
+    timeout_s: float,
+    max_retries: int,
+    base_delay_s: float,
+    max_delay_s: float,
+) -> Tuple[Optional[httpx.Response], Optional[str], int]:
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            resp = await client.request(
+                method, url, headers=headers, json=json_payload, timeout=timeout_s
+            )
+            if resp.status_code in RETRIABLE_STATUS and attempt <= max_retries:
+                delay = min(max_delay_s, base_delay_s * (2 ** (attempt - 1)))
+                delay *= (0.7 + 0.6 * random.random())
+                await asyncio.sleep(delay)
+                continue
+            return resp, None, attempt
+        except (httpx.TimeoutException, httpx.NetworkError) as e:
+            err = f"{type(e).__name__}: {e}"
+            if attempt <= max_retries:
+                delay = min(max_delay_s, base_delay_s * (2 ** (attempt - 1)))
+                delay *= (0.7 + 0.6 * random.random())
+                await asyncio.sleep(delay)
+                continue
+            return None, err, attempt
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}", attempt
+
+
+# ----------------------------
+# Providers
+# ----------------------------
+
+class LLMProvider:
+    def __init__(self, cfg: ProviderConfig, run_cfg: RunConfig):
+        self.cfg = cfg
+        self.run_cfg = run_cfg
+
+    async def call(self, prompt: str, image_data_url: Optional[str] = None) -> Dict[str, Any]:
+        p = self.cfg.provider.lower()
+        if p == "openai":
+            return await self._call_openai_chat_completions(prompt, image_data_url)
+        elif p == "gemini":
+            return await self._call_gemini(prompt, image_data_url)
+        elif p == "claude":
+            return await self._call_claude(prompt, image_data_url)
+        else:
+            raise ValueError(f"Unknown provider: {self.cfg.provider}")
+
+    async def _call_openai_chat_completions(self, prompt: str, image_data_url: Optional[str]) -> Dict[str, Any]:
+        url = self.cfg.base_url.rstrip("/") + "/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {self.cfg.api_key}"}
+
+        if image_data_url:
+            user_content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+            ]
+        else:
+            user_content = prompt
+
+        payload = {
+            "model": self.cfg.model,
+            "temperature": self.cfg.temperature,
+            "max_tokens": self.cfg.max_tokens,
+            "messages": [
+                {"role": "system", "content": "You are a careful assistant. Follow instructions exactly."},
+                {"role": "user", "content": user_content},
+            ],
+        }
+
+        async with make_async_client(self.run_cfg) as client:
+            resp, err, attempts = await request_with_retry(
+                client, "POST", url, headers, payload,
+                self.cfg.timeout_s, self.run_cfg.max_retries,
+                self.run_cfg.retry_base_delay_s, self.run_cfg.retry_max_delay_s
+            )
+        return {
+            "request": payload,
+            "response": self._resp_json(resp),
+            "error": err,
+            "attempts": attempts,
+            "status": getattr(resp, "status_code", None),
+        }
+
+    async def _call_gemini(self, prompt: str, image_data_url: Optional[str]) -> Dict[str, Any]:
+        base = self.cfg.base_url.rstrip("/")
+        url = f"{base}/v1beta/models/{self.cfg.model}:generateContent?key={self.cfg.api_key}"
+
+        parts = [{"text": prompt}]
+        if image_data_url:
+            b64 = image_data_url.split("base64,", 1)[-1]
+            mime = image_data_url.split(":", 1)[-1].split(";", 1)[0]
+            parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+
+        payload = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {
+                "temperature": self.cfg.temperature,
+                "maxOutputTokens": self.cfg.max_tokens,
+            },
+        }
+
+        async with make_async_client(self.run_cfg) as client:
+            resp, err, attempts = await request_with_retry(
+                client, "POST", url, {}, payload,
+                self.cfg.timeout_s, self.run_cfg.max_retries,
+                self.run_cfg.retry_base_delay_s, self.run_cfg.retry_max_delay_s
+            )
+        return {
+            "request": payload,
+            "response": self._resp_json(resp),
+            "error": err,
+            "attempts": attempts,
+            "status": getattr(resp, "status_code", None),
+        }
+
+    async def _call_claude(self, prompt: str, image_data_url: Optional[str]) -> Dict[str, Any]:
+        url = self.cfg.base_url.rstrip("/") + "/v1/messages"
+        headers = {
+            "x-api-key": self.cfg.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+        content_blocks = [{"type": "text", "text": prompt}]
+        if image_data_url:
+            b64 = image_data_url.split("base64,", 1)[-1]
+            mime = image_data_url.split(":", 1)[-1].split(";", 1)[0]
+            content_blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": b64}
+            })
+
+        payload = {
+            "model": self.cfg.model,
+            "max_tokens": self.cfg.max_tokens,
+            "temperature": self.cfg.temperature,
+            "messages": [{"role": "user", "content": content_blocks}],
+        }
+
+        async with make_async_client(self.run_cfg) as client:
+            resp, err, attempts = await request_with_retry(
+                client, "POST", url, headers, payload,
+                self.cfg.timeout_s, self.run_cfg.max_retries,
+                self.run_cfg.retry_base_delay_s, self.run_cfg.retry_max_delay_s
+            )
+        return {
+            "request": payload,
+            "response": self._resp_json(resp),
+            "error": err,
+            "attempts": attempts,
+            "status": getattr(resp, "status_code", None),
+        }
+
+    @staticmethod
+    def _resp_json(resp: Optional[httpx.Response]) -> Any:
+        if resp is None:
+            return None
+        try:
+            return resp.json()
+        except Exception:
+            return {"raw_text": resp.text}
+
+
+def extract_text_from_provider_response(provider: str, resp_json: Any) -> str:
+    if not resp_json:
+        return ""
+    p = provider.lower()
+    try:
+        if p == "openai":
+            choices = resp_json.get("choices", [])
+            if not choices:
+                return ""
+            content = choices[0]["message"]["content"]
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                texts = []
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "text":
+                        texts.append(blk.get("text", ""))
+                return "\n".join(texts).strip()
+            return str(content)
+
+        if p == "gemini":
+            cands = resp_json.get("candidates", [])
+            if not cands:
+                return ""
+            parts = cands[0].get("content", {}).get("parts", [])
+            texts = [pt.get("text", "") for pt in parts if isinstance(pt, dict) and "text" in pt]
+            return "\n".join(texts).strip()
+
+        if p == "claude":
+            blocks = resp_json.get("content", [])
+            texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
+            return "\n".join(texts).strip()
+    except Exception:
+        return ""
+    return ""
+
+
+# ----------------------------
+# Prompting
+# ----------------------------
+
+def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
+    opts = "\n".join(options)
+
+    if not cot_on:
+        return (
+            "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
+            "Output format rules (STRICT):\n"
+            "1) Output ONLY option letters among A,B,C,D,E.\n"
+            "2) If multiple, separate by comma ',' with NO spaces. Example: A,B,C\n"
+            "3) Do not output any other characters, words, punctuation, or spaces.\n\n"
+            f"Question:\n{question}\n\n"
+            f"Options:\n{opts}\n"
+        )
+
+    return (
+        "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
+        "You may provide reasoning, but you MUST follow the output rules.\n"
+        "Output rules:\n"
+        "1) You may write reasoning first.\n"
+        "2) On the LAST line, output the final answer in EXACT format:\n"
+        "   Answer:A,B,C\n"
+        "   - Use ONLY letters among A,B,C,D,E\n"
+        "   - If multiple, separate by comma ',' with NO spaces\n"
+        "   - Do not output anything after that line\n\n"
+        f"Question:\n{question}\n\n"
+        f"Options:\n{opts}\n"
+    )
+
+def build_judge_prompt(question: str, options: List[str], model_raw_text: str, gold: str) -> str:
+    opts = "\n".join(options)
+    gold_norm = normalize_csv_letters(gold)
+    return (
+        "You are an impartial evaluator (judge) for a multiple-choice question. Some questions may have multiple correct options.\n"
+        "Decide whether the model's answer should be counted as correct.\n"
+        "Gold is provided.\n\n"
+        "Return ONLY valid JSON with schema:\n"
+        '{\n'
+        '  "verdict": "correct" | "incorrect" | "unjudgeable",  # The final verdict of the model\'s answer.\n'
+        '  "extracted_answer": string|null,  # The model\'s extracted answer, null if not extractable.\n'
+        '  "reason": string  # A brief reason for the verdict.\n'
+        '}\n\n'
+        f"Question:\n{question}\n\n"
+        f"Options:\n{opts}\n\n"
+        f"Gold (normalized):\n{gold_norm}\n\n"
+        f"Model response:\n{model_raw_text}\n"
+    )
+
+
+def parse_judge_json(text: str) -> Dict[str, Any]:
+    """
+    Parse the judge's output and return a structured dictionary.
+    """
+    text = (text or "").strip()
+    try:
+        # 解析裁判模型返回的 JSON
+        judge_json = json.loads(text)
+
+        # 解析 "verdict" 字段
+        verdict = judge_json.get("verdict", "").lower()
+
+        # 根据 "verdict" 判断结果
+        if verdict == "correct":
+            judge_json["judge_correct"] = True
+        elif verdict == "incorrect":
+            judge_json["judge_correct"] = False
+        else:
+            judge_json["judge_correct"] = None
+
+        return judge_json
+    except Exception as e:
+        # 如果解析失败，返回一个默认的结果
+        return {"verdict": "unjudgeable", "extracted_answer": None, "reason": f"Failed to parse judge JSON: {str(e)}"}
+
+
+# ----------------------------
+# Evaluation core
+# ----------------------------
+
+async def eval_one(
+        row: Dict[str, Any],
+        idx: int,
+        total: int,
+        model_provider: LLMProvider,
+        judge_provider: Optional[LLMProvider],
+        run_cfg: RunConfig,
+        sem: asyncio.Semaphore,
+        results_path: str,
+) -> Dict[str, Any]:
+    qid = str(row.get("id", "")).strip()
+    question = str(row.get("Question", "")).strip()
+    options = load_options(row.get("Options", ""))  # 获取选项
+    question_type = str(row.get("Question_Type", "")).strip()  # 获取题目类型
+
+    gold_raw = str(row.get("Answer", "")).strip().upper()
+    if question_type == "Multiple Choice":
+        gold_norm = normalize_csv_letters(gold_raw)  # 仅在选择题中进行标准化
+    else:
+        gold_norm = gold_raw  # 对于填空题，直接使用 gold_raw
+
+    img_rel = str(row.get("Image", "") or "").strip()
+    img_dep = int(row.get("Image_Dependency", 0) or 0)
+
+    cot_on = (run_cfg.cot == "on")
+
+    # Resolve image
+    image_path = None
+    image_data_url = None
+    if img_rel:
+        image_path = img_rel
+        if run_cfg.images_root:
+            image_path = os.path.join(run_cfg.images_root, img_rel) if not os.path.isabs(img_rel) else img_rel
+        if os.path.exists(image_path):
+            image_data_url = image_file_to_data_url(image_path)
+
+    # Skip if image required but missing
+    if img_dep == 1 and not image_data_url and run_cfg.skip_image_missing:
+        out = {
+            "id": qid,
+            "idx": idx,
+            "total": total,
+            "skipped": True,
+            "skip_reason": "image_required_but_missing",
+            "gold_raw": gold_raw,
+            "gold": gold_norm,
+            "pred_raw": None,
+            "pred": None,
+            "rule_correct": False,
+            "judge_correct": None,
+            "latency_ms": 0,
+            "image_path": image_path,
+            "model_call": None,
+            "judge_call": None,
+        }
+        safe_jsonl_append(results_path, out)
+        print(f"[{idx}/{total}] id={qid}  SKIP(image missing)  gold={gold_norm}  image={img_rel}", flush=True)
+        return out
+
+    if question_type == "Multiple Choice":
+        # 选择题直接判断
+        prompt = build_mcq_prompt(question, options, cot_on=cot_on)
+    else:
+        # 填空题使用裁判判断
+        prompt = f"Answer the following question:\n\n{question}\n\nProvide a complete and accurate answer:"
+
+    # Real-time: start
+    print(
+        f"[{idx}/{total}] id={qid}  START  gold={gold_norm}  img_dep={img_dep}  img={'yes' if bool(image_data_url) else 'no'}  cot={run_cfg.cot}",
+        flush=True
+    )
+
+    async with sem:
+        t0 = now_ms()
+        model_call = await model_provider.call(prompt=prompt, image_data_url=image_data_url)
+        t1 = now_ms()
+
+    model_text = extract_text_from_provider_response(model_provider.cfg.provider, model_call.get("response"))
+
+    # 选择题与填空题的处理逻辑不同
+    if question_type == "Multiple Choice":
+        # 对选择题进行判断
+        pred_norm = extract_answer_from_text(model_text, cot_on=cot_on)  # 选择题的答案提取
+        rule_correct = (csv_to_set(pred_norm) == csv_to_set(gold_norm)) if pred_norm and gold_norm else False
+    else:
+        # 填空题直接使用模型返回的文本作为答案，裁判模型判断是否正确
+        pred_norm = model_text.strip()  # 填空题直接使用模型返回的文本作为答案
+        rule_correct = None  # 用裁判模型来判断是否正确
+
+    pred_raw = pred_norm  # keep compatible field meaning
+
+    if question_type == "Multiple Choice":
+        ok = "✅" if rule_correct else "❌"
+    else:
+        # 对于填空题，rule_correct 不适用，设置为 None
+        ok = "N/A"  # 填空题使用 "N/A" 或其他占位符表示不适用
+
+    preview = (model_text or "").replace("\n", " ").strip()
+    if len(preview) > 200:
+        preview = preview[:200] + "..."
+
+    print(
+        f"[{idx}/{total}] id={qid}  DONE  gold={gold_norm}  pred={pred_norm if pred_norm else None}  {ok}  {t1 - t0}ms",
+        flush=True
+    )
+    print(f"   model_text: {preview}", flush=True)
+    judge_call = None
+    judge_block = None
+    judge_correct = None
+
+    # 仅针对填空题使用裁判模型
+    if judge_provider is not None and question_type != "Multiple Choice":
+        # 裁判模型逻辑
+        judge_prompt = f"Evaluate if the model's answer to the question is correct:\nQuestion:\n{question}\nModel's Answer:\n{model_text}\nGold Answer:\n{gold_raw}"
+
+        async with sem:
+            jt0 = now_ms()
+            judge_call = await judge_provider.call(prompt=judge_prompt, image_data_url=image_data_url)
+            jt1 = now_ms()
+
+        judge_text = extract_text_from_provider_response(judge_provider.cfg.provider, judge_call.get("response"))
+        judge_json = parse_judge_json(judge_text)
+        verdict = str(judge_json.get("verdict", "unjudgeable")).lower()
+
+        if verdict == "correct":
+            judge_correct = True
+        elif verdict == "incorrect":
+            judge_correct = False
+        else:
+            judge_correct = None
+
+        extracted = judge_json.get("extracted_answer", None)
+        extracted_norm = normalize_csv_letters(extracted) if isinstance(extracted, str) else ""
+        judge_json["extracted_answer_normalized"] = extracted_norm
+
+        judge_block = {
+            "judge_text": judge_text,
+            "judge_json": judge_json,
+            "judge_latency_ms": jt1 - jt0,
+        }
+
+        jpreview = (judge_text or "").replace("\n", " ").strip()
+        if len(jpreview) > 200:
+            jpreview = jpreview[:200] + "..."
+        print(f"   judge_correct={judge_correct}  judge_latency={jt1 - jt0}ms", flush=True)
+        print(f"   judge_text: {jpreview}", flush=True)
+
+    out = {
+        "id": qid,
+        "idx": idx,
+        "total": total,
+        "skipped": False,
+        "skip_reason": None,
+        "gold_raw": gold_raw,
+        "gold": gold_norm,
+        "pred_raw": pred_raw,
+        "pred": pred_norm if pred_norm else None,
+        "rule_correct": rule_correct,
+        "judge_correct": judge_correct,
+        "latency_ms": t1 - t0,
+        "question": question,
+        "options": options,
+        "image_path": image_path,
+        "image_data_url": "image",  # Use "image" as placeholder
+        "cot": run_cfg.cot,
+        # FULL ARCHIVE:
+        "model_call": model_call,
+        "model_text": model_text,
+        "judge": judge_block,
+        "judge_call": judge_call,
+    }
+
+    # 使用时间戳+模型名称作为文件名
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    model_name = model_provider.cfg.model.replace(":", "_")
+    results_path = os.path.join(run_cfg.out_dir, f"results_{timestamp}_{model_name}.jsonl")  # All logs in one file
+    safe_jsonl_append(results_path, out)
+    return out
+
+
+
+
+
+async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optional[ProviderConfig],
+                   run_cfg: RunConfig) -> None:
+    ensure_dir(run_cfg.out_dir)
+
+    # Ensure all logs are written to the same file
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    model_name = model_cfg.model.replace(":", "_")
+    results_path = os.path.join(run_cfg.out_dir, f"results_{timestamp}_{model_name}.jsonl")  # Same file for all logs
+    summary_path = os.path.join(run_cfg.out_dir, "summary.json")
+
+    if os.path.exists(results_path):
+        os.remove(results_path)
+
+    model_provider = LLMProvider(model_cfg, run_cfg)
+    judge_provider = LLMProvider(judge_cfg, run_cfg) if judge_cfg else None
+
+    sem = asyncio.Semaphore(run_cfg.concurrency)
+
+    rows = df.to_dict(orient="records")
+    if run_cfg.limit is not None:
+        rows = rows[: run_cfg.limit]
+
+    total_questions = len(rows)
+    print(
+        f"Total questions: {total_questions} | concurrency={run_cfg.concurrency} | vpn={run_cfg.vpn} | cot={run_cfg.cot}",
+        flush=True
+    )
+
+    tasks = [
+        eval_one(r, i + 1, total_questions, model_provider, judge_provider, run_cfg, sem, results_path)
+        for i, r in enumerate(rows)
+    ]
+    results = await asyncio.gather(*tasks)
+
+    # Add a column for model correctness
+    for result, row in zip(results, rows):
+        row["model_correct"] = result.get("rule_correct") or result.get("judge_correct")
+
+    # Save results to a new Excel file
+    output_df = pd.DataFrame(rows)
+    output_df.to_excel(os.path.join(run_cfg.out_dir, f"evaluated_{timestamp}_{model_name}.xlsx"), index=False)
+
+    total = len(results)
+    skipped = sum(1 for r in results if r.get("skipped"))
+
+    failed = 0
+    for r in results:
+        mc = r.get("model_call")
+        if not mc:
+            continue
+        if mc.get("error"):
+            failed += 1
+            continue
+        st = mc.get("status")
+        if isinstance(st, int) and st >= 400:
+            failed += 1
+
+    latencies = [r.get("latency_ms", 0) for r in results if not r.get("skipped")]
+    avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
+
+    valid_rule = [
+        r for r in results
+        if (not r.get("skipped")) and (r.get("gold") or "") and (r.get("pred") or "")
+    ]
+    rule_acc = sum(1 for r in valid_rule if r.get("rule_correct")) / len(valid_rule) if valid_rule else 0.0
+
+    judge_acc = None
+    if judge_provider:
+        valid_judge = [r for r in results if (not r.get("skipped")) and (r.get("judge_correct") in [True, False])]
+        judge_acc = sum(1 for r in valid_judge if r.get("judge_correct") is True) / len(
+            valid_judge) if valid_judge else 0.0
+
+    summary = {
+        "total": total,
+        "skipped": skipped,
+        "failed_calls": failed,
+        "avg_latency_ms": avg_latency,
+        "rule_accuracy": rule_acc,
+        "judge_accuracy": judge_acc,
+        "timestamp_ms": now_ms(),
+        "vpn": run_cfg.vpn,
+        "proxy": run_cfg.proxy if run_cfg.vpn == "on" else "",
+        "cot": run_cfg.cot,
+        "model": {
+            "provider": model_cfg.provider,
+            "base_url": model_cfg.base_url,
+            "model": model_cfg.model,
+        },
+        "judge_model": None if not judge_cfg else {
+            "provider": judge_cfg.provider,
+            "base_url": judge_cfg.base_url,
+            "model": judge_cfg.model,
+        }
+    }
+
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    print(f"\nSaved full archives to: {results_path}", flush=True)
+    print(f"Saved summary to: {summary_path}", flush=True)
+
+
+
+
+# ----------------------------
+# CLI / Main
+# ----------------------------
+
+def build_provider_cfg(d: Dict[str, Any], prefix: str) -> ProviderConfig:
+    provider = d[f"{prefix}_provider"]
+    base_url = d[f"{prefix}_base_url"]
+    api_key = d[f"{prefix}_api_key"]
+    model = d[f"{prefix}__model"]
+    timeout_s = float(d.get(f"{prefix}_timeout_s", 60.0))
+    temperature = float(d.get(f"{prefix}_temperature", 0.0))
+    max_tokens = int(d.get(f"{prefix}_max_tokens", 512))
+    return ProviderConfig(
+        provider=provider,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout_s=timeout_s,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+def main():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--config", type=str, default="", help="Optional YAML config.")
+    ap.add_argument("--input", type=str, required=False, default="", help="Path to .xlsx dataset.")
+    ap.add_argument("--sheet", type=str, default="", help="Sheet name (default: first sheet).")
+    ap.add_argument("--images-root", type=str, default="", help="Root directory where 'images/' folder lives.")
+    ap.add_argument("--out-dir", type=str, default="out_eval", help="Output directory.")
+    ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--max-retries", type=int, default=4)
+    ap.add_argument("--retry-base-delay-s", type=float, default=1.0)
+    ap.add_argument("--retry-max-delay-s", type=float, default=16.0)
+    ap.add_argument("--limit", type=int, default=None)
+
+    # NEW: COT switch
+    ap.add_argument("--cot", type=str, choices=["on", "off"], default="off",
+                    help="COT mode: on=allow reasoning but require last line Answer:A,B,C ; off=answer only")
+
+    # VPN/proxy switch
+    ap.add_argument("--vpn", type=str, choices=["on", "off"], default="off",
+                    help="VPN mode switch: on=use proxy, off=direct")
+    ap.add_argument("--proxy", type=str, default="",
+                    help="Proxy URL, e.g. http://127.0.0.1:7897 or socks5://127.0.0.1:7897")
+
+    # model
+    ap.add_argument("--model-provider", type=str, default="")
+    ap.add_argument("--model-base-url", type=str, default="")
+    ap.add_argument("--model-api-key", type=str, default="")
+    ap.add_argument("--model-name", type=str, default="")
+    ap.add_argument("--model-timeout-s", type=float, default=60.0)
+    ap.add_argument("--model-temperature", type=float, default=0.0)
+    ap.add_argument("--model-max-tokens", type=int, default=256)
+
+    # judge
+    ap.add_argument("--judge-enable", action="store_true")
+    ap.add_argument("--judge-provider", type=str, default="")
+    ap.add_argument("--judge-base-url", type=str, default="")
+    ap.add_argument("--judge-api-key", type=str, default="")
+    ap.add_argument("--judge-name", type=str, default="")
+    ap.add_argument("--judge-timeout-s", type=float, default=60.0)
+    ap.add_argument("--judge-temperature", type=float, default=0.0)
+    ap.add_argument("--judge-max-tokens", type=int, default=256)
+
+    args = ap.parse_args()
+
+    cfg = load_yaml_config(args.config) if args.config else {}
+
+    input_path = args.input or cfg.get("input_path", "")
+    if not input_path:
+        raise ValueError("Missing --input (xlsx path) or input_path in YAML.")
+
+    sheet_name = args.sheet or cfg.get("sheet_name", "")
+    sheet_name = sheet_name if sheet_name else None
+
+    images_root = args.images_root or cfg.get("images_root", "")
+    out_dir = args.out_dir or cfg.get("out_dir", "out_eval")
+
+    # model cfg
+    model_dict = {
+        "model_provider": args.model_provider or cfg.get("model", {}).get("provider", "openai"),
+        "model_base_url": args.model_base_url or cfg.get("model", {}).get("base_url", "https://api.openai.com"),
+        "model_api_key": args.model_api_key or cfg.get("model", {}).get("api_key", os.getenv("OPENAI_API_KEY", "")),
+        "model_model": args.model_name or cfg.get("model", {}).get("model", ""),
+        "model_timeout_s": args.model_timeout_s or cfg.get("model", {}).get("timeout_s", 60.0),
+        "model_temperature": args.model_temperature if args.model_temperature is not None else cfg.get("model", {}).get("temperature", 0.0),
+        "model_max_tokens": args.model_max_tokens or cfg.get("model", {}).get("max_tokens", 256),
+    }
+    if not model_dict["model_model"]:
+        raise ValueError("Missing model name: --model-name or model.model in YAML.")
+    if not model_dict["model_api_key"] and model_dict["model_provider"].lower() != "gemini":
+        raise ValueError("Missing model api key: --model-api-key or env/YAML.")
+
+    # IMPORTANT: keep your original mapping for build_provider_cfg
+    # build_provider_cfg expects keys: f"{prefix}_provider/base_url/api_key/model"
+    model_dict_for_builder = {
+        "model_provider": model_dict["model_provider"],
+        "model_base_url": model_dict["model_base_url"],
+        "model_api_key": model_dict["model_api_key"],
+        "model_model": model_dict["model_model"],
+        "model_timeout_s": model_dict["model_timeout_s"],
+        "model_temperature": model_dict["model_temperature"],
+        "model_max_tokens": model_dict["model_max_tokens"],
+    }
+
+    # Fix: build_provider_cfg uses "{prefix}_model", not "{prefix}_model_model"
+    # So we create a compatible dict:
+    model_cfg = ProviderConfig(
+        provider=model_dict_for_builder["model_provider"],
+        base_url=model_dict_for_builder["model_base_url"],
+        api_key=model_dict_for_builder["model_api_key"],
+        model=model_dict_for_builder["model_model"],
+        timeout_s=float(model_dict_for_builder.get("model_timeout_s", 60.0)),
+        temperature=float(model_dict_for_builder.get("model_temperature", 0.0)),
+        max_tokens=int(model_dict_for_builder.get("model_max_tokens", 256)),
+    )
+
+    # judge cfg
+    judge_cfg = None
+    judge_enable = bool(args.judge_enable or cfg.get("judge", {}).get("enable", False))
+    if judge_enable:
+        judge_dict = {
+            "judge_provider": args.judge_provider or cfg.get("judge", {}).get("provider", model_cfg.provider),
+            "judge_base_url": args.judge_base_url or cfg.get("judge", {}).get("base_url", model_cfg.base_url),
+            "judge_api_key": args.judge_api_key or cfg.get("judge", {}).get("api_key", model_dict["model_api_key"]),
+            "judge_model": args.judge_name or cfg.get("judge", {}).get("model", model_cfg.model),
+            "judge_timeout_s": args.judge_timeout_s or cfg.get("judge", {}).get("timeout_s", 60.0),
+            "judge_temperature": args.judge_temperature if args.judge_temperature is not None else cfg.get("judge", {}).get("temperature", 0.0),
+            "judge_max_tokens": args.judge_max_tokens or cfg.get("judge", {}).get("max_tokens", 256),
+        }
+        if not judge_dict["judge_model"]:
+            raise ValueError("Judge enabled but judge model name missing: --judge-name or judge.model in YAML.")
+
+        judge_cfg = ProviderConfig(
+            provider=judge_dict["judge_provider"],
+            base_url=judge_dict["judge_base_url"],
+            api_key=judge_dict["judge_api_key"],
+            model=judge_dict["judge_model"],
+            timeout_s=float(judge_dict.get("judge_timeout_s", 60.0)),
+            temperature=float(judge_dict.get("judge_temperature", 0.0)),
+            max_tokens=int(judge_dict.get("judge_max_tokens", 256)),
+        )
+
+    run_cfg = RunConfig(
+        input_path=input_path,
+        sheet_name=sheet_name,
+        images_root=images_root,
+        out_dir=out_dir,
+        concurrency=args.concurrency or cfg.get("concurrency", 8),
+        max_retries=args.max_retries or cfg.get("max_retries", 4),
+        retry_base_delay_s=args.retry_base_delay_s or cfg.get("retry_base_delay_s", 1.0),
+        retry_max_delay_s=args.retry_max_delay_s or cfg.get("retry_max_delay_s", 16.0),
+        skip_image_missing=True,
+        limit=args.limit or cfg.get("limit", None),
+        cot=args.cot or cfg.get("cot", "off"),
+        vpn=args.vpn or cfg.get("vpn", "off"),
+        proxy=args.proxy or cfg.get("proxy", ""),
+    )
+
+    # Read xlsx
+    df = pd.read_excel(run_cfg.input_path, sheet_name=run_cfg.sheet_name, engine="openpyxl")
+    if isinstance(df, dict):
+        first_key = next(iter(df.keys()))
+        df = df[first_key]
+    df.columns = [normalize_colname(c) for c in df.columns]
+
+    asyncio.run(run_eval(df, model_cfg, judge_cfg, run_cfg))
+
+
+if __name__ == "__main__":
+    main()
