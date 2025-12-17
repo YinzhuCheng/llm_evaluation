@@ -158,6 +158,114 @@ def extract_answer_from_text(text: str, cot_on: bool) -> Optional[str]:
     return norm if norm else None
 
 
+def _sanitize_call_for_logging(provider: str, call_obj: Optional[Dict[str, Any]], image_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    """
+    Remove large base64 image payloads from request logs.
+    Replace them with a compact reference (image_path) so jsonl stays readable.
+    """
+    if not call_obj:
+        return call_obj
+
+    # shallow copy top-level dict
+    out = dict(call_obj)
+    req = out.get("request")
+    if not isinstance(req, dict):
+        return out
+
+    p = (provider or "").lower()
+    req2 = dict(req)
+
+    try:
+        if p == "openai":
+            # messages: [{role, content}, ...]
+            messages = req2.get("messages")
+            if isinstance(messages, list):
+                new_messages = []
+                for msg in messages:
+                    if not isinstance(msg, dict):
+                        new_messages.append(msg)
+                        continue
+                    msg2 = dict(msg)
+                    content = msg2.get("content")
+                    # user content can be list of blocks
+                    if isinstance(content, list):
+                        new_blocks = []
+                        for blk in content:
+                            if isinstance(blk, dict) and blk.get("type") == "image_url":
+                                blk2 = dict(blk)
+                                img = blk2.get("image_url")
+                                if isinstance(img, dict):
+                                    img2 = dict(img)
+                                    img2["url"] = image_path or "<image_omitted>"
+                                    blk2["image_url"] = img2
+                                new_blocks.append(blk2)
+                            else:
+                                new_blocks.append(blk)
+                        msg2["content"] = new_blocks
+                    new_messages.append(msg2)
+                req2["messages"] = new_messages
+
+        elif p == "gemini":
+            # contents: [{role, parts:[{text}|{inline_data:{mime_type,data}}]}]
+            contents = req2.get("contents")
+            if isinstance(contents, list):
+                new_contents = []
+                for c in contents:
+                    if not isinstance(c, dict):
+                        new_contents.append(c)
+                        continue
+                    c2 = dict(c)
+                    parts = c2.get("parts")
+                    if isinstance(parts, list):
+                        new_parts = []
+                        for pt in parts:
+                            if isinstance(pt, dict) and "inline_data" in pt and isinstance(pt.get("inline_data"), dict):
+                                pt2 = dict(pt)
+                                inline2 = dict(pt2["inline_data"])
+                                inline2["data"] = image_path or "<image_omitted>"
+                                pt2["inline_data"] = inline2
+                                new_parts.append(pt2)
+                            else:
+                                new_parts.append(pt)
+                        c2["parts"] = new_parts
+                    new_contents.append(c2)
+                req2["contents"] = new_contents
+
+        elif p == "claude":
+            # messages: [{role, content:[{type:text}|{type:image, source:{... data:...}}]}]
+            messages = req2.get("messages")
+            if isinstance(messages, list):
+                new_messages = []
+                for msg in messages:
+                    if not isinstance(msg, dict):
+                        new_messages.append(msg)
+                        continue
+                    msg2 = dict(msg)
+                    content = msg2.get("content")
+                    if isinstance(content, list):
+                        new_blocks = []
+                        for blk in content:
+                            if isinstance(blk, dict) and blk.get("type") == "image":
+                                blk2 = dict(blk)
+                                src = blk2.get("source")
+                                if isinstance(src, dict):
+                                    src2 = dict(src)
+                                    src2["data"] = image_path or "<image_omitted>"
+                                    blk2["source"] = src2
+                                new_blocks.append(blk2)
+                            else:
+                                new_blocks.append(blk)
+                        msg2["content"] = new_blocks
+                    new_messages.append(msg2)
+                req2["messages"] = new_messages
+    except Exception:
+        # Best-effort sanitization only; never break logging due to unexpected schema.
+        pass
+
+    out["request"] = req2
+    return out
+
+
 # ----------------------------
 # Config
 # ----------------------------
@@ -512,6 +620,7 @@ async def eval_one(
         judge_provider: Optional[LLMProvider],
         run_cfg: RunConfig,
         sem: asyncio.Semaphore,
+        write_lock: asyncio.Lock,
         results_path: str,
 ) -> Dict[str, Any]:
     qid = str(row.get("id", "")).strip()
@@ -559,7 +668,8 @@ async def eval_one(
             "model_call": None,
             "judge_call": None,
         }
-        safe_jsonl_append(results_path, out)
+        async with write_lock:
+            safe_jsonl_append(results_path, out)
         print(f"[{idx}/{total}] id={qid}  SKIP(image missing)  gold={gold_norm}  image={img_rel}", flush=True)
         return out
 
@@ -582,6 +692,7 @@ async def eval_one(
         t1 = now_ms()
 
     model_text = extract_text_from_provider_response(model_provider.cfg.provider, model_call.get("response"))
+    model_call_log = _sanitize_call_for_logging(model_provider.cfg.provider, model_call, image_path)
 
     # 选择题与填空题的处理逻辑不同
     if question_type == "Multiple Choice":
@@ -613,6 +724,7 @@ async def eval_one(
     judge_call = None
     judge_block = None
     judge_correct = None
+    judge_call_log = None
 
     # 仅针对填空题使用裁判模型
     if judge_provider is not None and question_type != "Multiple Choice":
@@ -625,6 +737,7 @@ async def eval_one(
             jt1 = now_ms()
 
         judge_text = extract_text_from_provider_response(judge_provider.cfg.provider, judge_call.get("response"))
+        judge_call_log = _sanitize_call_for_logging(judge_provider.cfg.provider, judge_call, image_path)
         judge_json = parse_judge_json(judge_text)
         verdict = str(judge_json.get("verdict", "unjudgeable")).lower()
 
@@ -667,20 +780,19 @@ async def eval_one(
         "question": question,
         "options": options,
         "image_path": image_path,
-        "image_data_url": "image",  # Use "image" as placeholder
+        # Keep a compact image reference; do NOT log base64.
+        "image_data_url": image_path if image_path else None,
         "cot": run_cfg.cot,
         # FULL ARCHIVE:
-        "model_call": model_call,
+        "model_call": model_call_log,
         "model_text": model_text,
         "judge": judge_block,
-        "judge_call": judge_call,
+        "judge_call": judge_call_log,
     }
 
-    # 使用时间戳+模型名称作为文件名
-    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    model_name = model_provider.cfg.model.replace(":", "_")
-    results_path = os.path.join(run_cfg.out_dir, f"results_{timestamp}_{model_name}.jsonl")  # All logs in one file
-    safe_jsonl_append(results_path, out)
+    # IMPORTANT: Always append to the single shared results_path computed in run_eval().
+    async with write_lock:
+        safe_jsonl_append(results_path, out)
     return out
 
 
@@ -704,6 +816,7 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     judge_provider = LLMProvider(judge_cfg, run_cfg) if judge_cfg else None
 
     sem = asyncio.Semaphore(run_cfg.concurrency)
+    write_lock = asyncio.Lock()
 
     rows = df.to_dict(orient="records")
     if run_cfg.limit is not None:
@@ -716,7 +829,7 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     )
 
     tasks = [
-        eval_one(r, i + 1, total_questions, model_provider, judge_provider, run_cfg, sem, results_path)
+        eval_one(r, i + 1, total_questions, model_provider, judge_provider, run_cfg, sem, write_lock, results_path)
         for i, r in enumerate(rows)
     ]
     results = await asyncio.gather(*tasks)
