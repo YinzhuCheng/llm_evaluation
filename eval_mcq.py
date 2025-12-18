@@ -143,8 +143,24 @@ def extract_answer_from_text(text: str, cot_on: bool) -> Optional[str]:
         return None
 
     if cot_on:
-        # In COT mode we MUST avoid accidental extraction from the reasoning
-        # (A/B/C frequently appear in explanations). Only accept the dedicated final line.
+        # In COT mode we prefer explicit structured output.
+        # 1) Try JSON: {"answer":"A,B"} or {"final_answer":"A,B"}
+        try:
+            candidate = (text or "").strip()
+            if "```" in candidate:
+                candidate = re.sub(r"(?s)^```(?:json)?\s*|\s*```$", "", candidate.strip()).strip()
+            if candidate.startswith("{") and candidate.endswith("}"):
+                obj = json.loads(candidate)
+                if isinstance(obj, dict):
+                    for k in ("answer", "final_answer", "final"):
+                        v = obj.get(k)
+                        if isinstance(v, str):
+                            norm = normalize_csv_letters(v)
+                            return norm if norm else None
+        except Exception:
+            pass
+
+        # 2) Fallback: dedicated final line like Answer:A,B
         m = FINAL_ANSWER_RE.search(text)
         if m:
             norm = normalize_csv_letters(m.group(1))
@@ -308,7 +324,9 @@ class RunConfig:
     sheet_name: Optional[str]
     images_root: str
     out_dir: str
-    concurrency: int
+    concurrency: int  # legacy: if set, used as default for both model/judge concurrency
+    model_concurrency: int
+    judge_concurrency: int
     max_retries: int
     retry_base_delay_s: float
     retry_max_delay_s: float
@@ -572,16 +590,34 @@ def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
 
     return (
         "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
-        "You may provide short reasoning, but you MUST follow the output rules exactly.\n"
-        "Output rules (COT mode):\n"
-        "1) You may write reasoning first (any format), but avoid repeating the full options.\n"
-        "2) The LAST line MUST be EXACTLY one of the following forms (no extra text):\n"
-        "   Answer:A\n"
-        "   Answer:A,B,C\n"
-        "   (use ONLY letters among A,B,C,D,E; comma ',' with NO spaces)\n"
-        "3) Do NOT output anything after the last line.\n\n"
+        "You may think step-by-step internally, but you MUST NOT output chain-of-thought.\n"
+        "Output format rules (COT mode, STRICT):\n"
+        "- Return ONLY a JSON object. No markdown. No extra text.\n"
+        "- JSON schema:\n"
+        '{ "answer": "A" | "A,B,C", "brief_reason": string }\n'
+        "- 'answer' must contain ONLY letters among A,B,C,D,E.\n"
+        "- If multiple, separate by comma ',' with NO spaces (example: \"A,B,C\").\n"
+        "- 'brief_reason' should be short (1-3 sentences).\n"
+        "Example:\n"
+        '{ "answer": "B", "brief_reason": "A 4g-gon is the standard fundamental polygon for genus g." }\n\n'
         f"Question:\n{question}\n\n"
         f"Options:\n{opts}\n"
+    )
+
+
+def build_freeform_answer_prompt(question: str, cot_on: bool) -> str:
+    if not cot_on:
+        return f"Answer the following question:\n\n{question}\n\nProvide a complete and accurate answer:"
+    return (
+        "Answer the following question.\n"
+        "You may think step-by-step internally, but you MUST NOT output chain-of-thought.\n"
+        "Output format rules (COT mode, STRICT):\n"
+        "- Return ONLY a JSON object. No markdown. No extra text.\n"
+        "- JSON schema:\n"
+        '{ "answer": string, "brief_reason": string }\n'
+        "- 'answer' must be the final result only (concise, no derivations).\n"
+        "- 'brief_reason' should be short (1-3 sentences).\n\n"
+        f"Question:\n{question}\n"
     )
 
 def build_freeform_judge_prompt(question: str, model_answer: str, gold: str) -> str:
@@ -690,7 +726,8 @@ async def eval_one(
         model_provider: LLMProvider,
         judge_provider: Optional[LLMProvider],
         run_cfg: RunConfig,
-        sem: asyncio.Semaphore,
+        model_sem: asyncio.Semaphore,
+        judge_sem: asyncio.Semaphore,
         write_lock: asyncio.Lock,
         results_path: str,
 ) -> Dict[str, Any]:
@@ -745,9 +782,9 @@ async def eval_one(
     if mcq:
         prompt = build_mcq_prompt(question, options, cot_on=cot_on)
     else:
-        prompt = f"Answer the following question:\n\n{question}\n\nProvide a complete and accurate answer:"
+        prompt = build_freeform_answer_prompt(question, cot_on=cot_on)
 
-    async with sem:
+    async with model_sem:
         t0 = now_ms()
         model_call = await model_provider.call(prompt=prompt, image_data_url=image_data_url)
         t1 = now_ms()
@@ -771,7 +808,7 @@ async def eval_one(
             if mcq
             else build_freeform_judge_prompt(question, model_text, gold_raw)
         )
-        async with sem:
+        async with judge_sem:
             jt0 = now_ms()
             judge_call = await judge_provider.call(prompt=judge_prompt, image_data_url=image_data_url)
             jt1 = now_ms()
@@ -894,12 +931,20 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
 
     total_questions = len(rows)
     print(
-        f"Total questions: {total_questions} | concurrency={run_cfg.concurrency} | vpn={run_cfg.vpn} | cot={run_cfg.cot}",
+        f"Total questions: {total_questions} | model_concurrency={run_cfg.model_concurrency} | judge_concurrency={run_cfg.judge_concurrency} | vpn={run_cfg.vpn} | cot={run_cfg.cot}",
         flush=True
     )
 
+    model_sem = asyncio.Semaphore(run_cfg.model_concurrency)
+    judge_sem = asyncio.Semaphore(run_cfg.judge_concurrency)
+
     tasks = [
-        eval_one(r, i + 1, total_questions, model_provider, judge_provider, run_cfg, sem, write_lock, results_path)
+        eval_one(
+            r, i + 1, total_questions,
+            model_provider, judge_provider, run_cfg,
+            model_sem, judge_sem,
+            write_lock, results_path
+        )
         for i, r in enumerate(rows)
     ]
     results = await asyncio.gather(*tasks)
@@ -1034,7 +1079,9 @@ def main():
     ap.add_argument("--sheet", type=str, default="", help="Sheet name (default: first sheet).")
     ap.add_argument("--images-root", type=str, default="", help="Root directory where 'images/' folder lives.")
     ap.add_argument("--out-dir", type=str, default="out_eval", help="Output directory.")
-    ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--concurrency", type=int, default=8, help="(legacy) used as default for both model/judge concurrency")
+    ap.add_argument("--model-concurrency", type=int, default=None, help="Max in-flight requests to the answering model")
+    ap.add_argument("--judge-concurrency", type=int, default=None, help="Max in-flight requests to the judge model")
     ap.add_argument("--max-retries", type=int, default=4)
     ap.add_argument("--retry-base-delay-s", type=float, default=1.0)
     ap.add_argument("--retry-max-delay-s", type=float, default=16.0)
@@ -1154,12 +1201,19 @@ def main():
         max_tokens=int(judge_dict.get("judge_max_tokens", 256)),
     )
 
+    # Concurrency: split quotas (pipeline). If not set, fall back to legacy --concurrency / YAML 'concurrency'.
+    legacy_conc = args.concurrency or cfg.get("concurrency", 8)
+    model_conc = args.model_concurrency if args.model_concurrency is not None else int(cfg.get("model_concurrency", legacy_conc))
+    judge_conc = args.judge_concurrency if args.judge_concurrency is not None else int(cfg.get("judge_concurrency", legacy_conc))
+
     run_cfg = RunConfig(
         input_path=input_path,
         sheet_name=sheet_name,
         images_root=images_root,
         out_dir=out_dir,
-        concurrency=args.concurrency or cfg.get("concurrency", 8),
+        concurrency=legacy_conc,
+        model_concurrency=int(model_conc),
+        judge_concurrency=int(judge_conc),
         max_retries=args.max_retries or cfg.get("max_retries", 4),
         retry_base_delay_s=args.retry_base_delay_s or cfg.get("retry_base_delay_s", 1.0),
         retry_max_delay_s=args.retry_max_delay_s or cfg.get("retry_max_delay_s", 16.0),
