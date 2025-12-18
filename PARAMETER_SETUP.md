@@ -157,7 +157,7 @@ model:
   model: gpt-4.1-mini
   timeout_s: 60
   temperature: 0
-  max_tokens: 256
+  max_tokens: 10000
 
 judge:
   provider: openai
@@ -166,7 +166,7 @@ judge:
   model: gpt-4.1-mini
   timeout_s: 60
   temperature: 0
-  max_tokens: 256
+  max_tokens: 10000
 ```
 
 命令行示例：
