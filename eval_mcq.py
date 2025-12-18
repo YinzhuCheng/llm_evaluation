@@ -914,7 +914,7 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     model_name_safe = re.sub(r'[<>:"/\\|?*]', '_', model_cfg.model)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     results_path = os.path.join(run_cfg.out_dir, f"results_{timestamp}_{model_name_safe}.jsonl")  # Same file for all logs
-    summary_path = os.path.join(run_cfg.out_dir, f"summary_{timestamp}.json")
+    summary_path = os.path.join(run_cfg.out_dir, f"summary_{timestamp}_{model_name_safe}.json")
 
     if os.path.exists(results_path):
         os.remove(results_path)
@@ -1013,11 +1013,6 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
             "correct": overall_correct,
             "total": overall_total,
             "score": overall_score_str,
-        },
-        "judged": {
-            "correct": judged_correct,
-            "total": judged_total,
-            "score": judged_score_str,
         },
 
         "timestamp_ms": now_ms(),
