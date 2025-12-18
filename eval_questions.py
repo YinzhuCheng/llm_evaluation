@@ -1052,7 +1052,7 @@ def build_provider_cfg(d: Dict[str, Any], prefix: str) -> ProviderConfig:
     provider = d[f"{prefix}_provider"]
     base_url = d[f"{prefix}_base_url"]
     api_key = d[f"{prefix}_api_key"]
-    model = d[f"{prefix}__model"]
+    model = d[f"{prefix}_model"]
     timeout_s = float(d.get(f"{prefix}_timeout_s", 60.0))
     temperature = float(d.get(f"{prefix}_temperature", 0.0))
     max_tokens = int(d.get(f"{prefix}_max_tokens", 512))
@@ -1073,21 +1073,26 @@ def main():
     ap.add_argument("--input", type=str, required=False, default="", help="Path to .xlsx dataset.")
     ap.add_argument("--sheet", type=str, default="", help="Sheet name (default: first sheet).")
     ap.add_argument("--images-root", type=str, default="", help="Root directory where 'images/' folder lives.")
-    ap.add_argument("--out-dir", type=str, default="out_eval", help="Output directory.")
-    ap.add_argument("--concurrency", type=int, default=8, help="(legacy) used as default for both model/judge concurrency")
+    ap.add_argument("--out-dir", type=str, default=None, help="Output directory (default: from YAML or 'out_eval').")
+    ap.add_argument("--concurrency", type=int, default=None, help="(legacy) default for both model/judge concurrency")
     ap.add_argument("--model-concurrency", type=int, default=None, help="Max in-flight requests to the answering model")
     ap.add_argument("--judge-concurrency", type=int, default=None, help="Max in-flight requests to the judge model")
-    ap.add_argument("--max-retries", type=int, default=4)
-    ap.add_argument("--retry-base-delay-s", type=float, default=1.0)
-    ap.add_argument("--retry-max-delay-s", type=float, default=16.0)
+    ap.add_argument("--max-retries", type=int, default=None)
+    ap.add_argument("--retry-base-delay-s", type=float, default=None)
+    ap.add_argument("--retry-max-delay-s", type=float, default=None)
     ap.add_argument("--limit", type=int, default=None)
 
     # NEW: COT switch
-    ap.add_argument("--cot", type=str, choices=["on", "off"], default="off",
-                    help="COT mode: on=allow reasoning but require last line Answer:A,B,C ; off=answer only")
+    ap.add_argument(
+        "--cot",
+        type=str,
+        choices=["on", "off"],
+        default=None,
+        help="COT mode: on=force JSON output (answer, brief_reason) with NO chain-of-thought; off=answer-only",
+    )
 
     # VPN/proxy switch
-    ap.add_argument("--vpn", type=str, choices=["on", "off"], default="off",
+    ap.add_argument("--vpn", type=str, choices=["on", "off"], default=None,
                     help="VPN mode switch: on=use proxy, off=direct")
     ap.add_argument("--proxy", type=str, default="",
                     help="Proxy URL, e.g. http://127.0.0.1:7897 or socks5://127.0.0.1:7897")
@@ -1097,9 +1102,9 @@ def main():
     ap.add_argument("--model-base-url", type=str, default="")
     ap.add_argument("--model-api-key", type=str, default="")
     ap.add_argument("--model-name", type=str, default="")
-    ap.add_argument("--model-timeout-s", type=float, default=60.0)
-    ap.add_argument("--model-temperature", type=float, default=0.0)
-    ap.add_argument("--model-max-tokens", type=int, default=10000)
+    ap.add_argument("--model-timeout-s", type=float, default=None)
+    ap.add_argument("--model-temperature", type=float, default=None)
+    ap.add_argument("--model-max-tokens", type=int, default=None)
 
     # judge
     ap.add_argument("--judge-enable", action="store_true",
@@ -1108,9 +1113,9 @@ def main():
     ap.add_argument("--judge-base-url", type=str, default="")
     ap.add_argument("--judge-api-key", type=str, default="")
     ap.add_argument("--judge-name", type=str, default="")
-    ap.add_argument("--judge-timeout-s", type=float, default=60.0)
-    ap.add_argument("--judge-temperature", type=float, default=0.0)
-    ap.add_argument("--judge-max-tokens", type=int, default=10000)
+    ap.add_argument("--judge-timeout-s", type=float, default=None)
+    ap.add_argument("--judge-temperature", type=float, default=None)
+    ap.add_argument("--judge-max-tokens", type=int, default=None)
 
     args = ap.parse_args()
 
@@ -1124,7 +1129,7 @@ def main():
     sheet_name = sheet_name if sheet_name else None
 
     images_root = args.images_root or cfg.get("images_root", "")
-    out_dir = args.out_dir or cfg.get("out_dir", "out_eval")
+    out_dir = (args.out_dir if args.out_dir is not None else cfg.get("out_dir", "out_eval"))
 
     # model cfg
     model_dict = {
@@ -1132,9 +1137,9 @@ def main():
         "model_base_url": args.model_base_url or cfg.get("model", {}).get("base_url", "https://api.openai.com"),
         "model_api_key": args.model_api_key or cfg.get("model", {}).get("api_key", os.getenv("OPENAI_API_KEY", "")),
         "model_model": args.model_name or cfg.get("model", {}).get("model", ""),
-        "model_timeout_s": args.model_timeout_s or cfg.get("model", {}).get("timeout_s", 60.0),
-        "model_temperature": args.model_temperature if args.model_temperature is not None else cfg.get("model", {}).get("temperature", 0.0),
-        "model_max_tokens": args.model_max_tokens or cfg.get("model", {}).get("max_tokens", 256),
+        "model_timeout_s": (args.model_timeout_s if args.model_timeout_s is not None else cfg.get("model", {}).get("timeout_s", 60.0)),
+        "model_temperature": (args.model_temperature if args.model_temperature is not None else cfg.get("model", {}).get("temperature", 0.0)),
+        "model_max_tokens": (args.model_max_tokens if args.model_max_tokens is not None else cfg.get("model", {}).get("max_tokens", 256)),
     }
     if not model_dict["model_model"]:
         raise ValueError("Missing model name: --model-name or model.model in YAML.")
@@ -1175,11 +1180,11 @@ def main():
             or model_dict.get("model_api_key", "")
         ),
         "judge_model": args.judge_name or cfg.get("judge", {}).get("model", model_cfg.model),
-        "judge_timeout_s": args.judge_timeout_s or cfg.get("judge", {}).get("timeout_s", 60.0),
+        "judge_timeout_s": (args.judge_timeout_s if args.judge_timeout_s is not None else cfg.get("judge", {}).get("timeout_s", 60.0)),
         "judge_temperature": (
             args.judge_temperature if args.judge_temperature is not None else cfg.get("judge", {}).get("temperature", 0.0)
         ),
-        "judge_max_tokens": args.judge_max_tokens or cfg.get("judge", {}).get("max_tokens", 256),
+        "judge_max_tokens": (args.judge_max_tokens if args.judge_max_tokens is not None else cfg.get("judge", {}).get("max_tokens", 256)),
     }
     if not judge_dict["judge_model"]:
         raise ValueError("Missing judge model name: --judge-name or judge.model in YAML (or model.model as fallback).")
@@ -1197,7 +1202,7 @@ def main():
     )
 
     # Concurrency: split quotas (pipeline). If not set, fall back to legacy --concurrency / YAML 'concurrency'.
-    legacy_conc = args.concurrency or cfg.get("concurrency", 8)
+    legacy_conc = (args.concurrency if args.concurrency is not None else cfg.get("concurrency", 8))
     model_conc = args.model_concurrency if args.model_concurrency is not None else int(cfg.get("model_concurrency", legacy_conc))
     judge_conc = args.judge_concurrency if args.judge_concurrency is not None else int(cfg.get("judge_concurrency", legacy_conc))
 
@@ -1209,13 +1214,13 @@ def main():
         concurrency=legacy_conc,
         model_concurrency=int(model_conc),
         judge_concurrency=int(judge_conc),
-        max_retries=args.max_retries or cfg.get("max_retries", 4),
-        retry_base_delay_s=args.retry_base_delay_s or cfg.get("retry_base_delay_s", 1.0),
-        retry_max_delay_s=args.retry_max_delay_s or cfg.get("retry_max_delay_s", 16.0),
+        max_retries=(args.max_retries if args.max_retries is not None else cfg.get("max_retries", 4)),
+        retry_base_delay_s=(args.retry_base_delay_s if args.retry_base_delay_s is not None else cfg.get("retry_base_delay_s", 1.0)),
+        retry_max_delay_s=(args.retry_max_delay_s if args.retry_max_delay_s is not None else cfg.get("retry_max_delay_s", 16.0)),
         skip_image_missing=True,
-        limit=args.limit or cfg.get("limit", None),
-        cot=args.cot or cfg.get("cot", "off"),
-        vpn=args.vpn or cfg.get("vpn", "off"),
+        limit=(args.limit if args.limit is not None else cfg.get("limit", None)),
+        cot=(args.cot if args.cot is not None else cfg.get("cot", "off")),
+        vpn=(args.vpn if args.vpn is not None else cfg.get("vpn", "off")),
         proxy=args.proxy or cfg.get("proxy", ""),
     )
 
