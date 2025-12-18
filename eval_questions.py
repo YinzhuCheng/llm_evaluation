@@ -1139,7 +1139,7 @@ def main():
         "model_model": args.model_name or cfg.get("model", {}).get("model", ""),
         "model_timeout_s": (args.model_timeout_s if args.model_timeout_s is not None else cfg.get("model", {}).get("timeout_s", 60.0)),
         "model_temperature": (args.model_temperature if args.model_temperature is not None else cfg.get("model", {}).get("temperature", 0.0)),
-        "model_max_tokens": (args.model_max_tokens if args.model_max_tokens is not None else cfg.get("model", {}).get("max_tokens", 256)),
+        "model_max_tokens": (args.model_max_tokens if args.model_max_tokens is not None else cfg.get("model", {}).get("max_tokens", 10000)),
     }
     if not model_dict["model_model"]:
         raise ValueError("Missing model name: --model-name or model.model in YAML.")
@@ -1167,7 +1167,7 @@ def main():
         model=model_dict_for_builder["model_model"],
         timeout_s=float(model_dict_for_builder.get("model_timeout_s", 60.0)),
         temperature=float(model_dict_for_builder.get("model_temperature", 0.0)),
-        max_tokens=int(model_dict_for_builder.get("model_max_tokens", 256)),
+        max_tokens=int(model_dict_for_builder.get("model_max_tokens", 10000)),
     )
 
     # judge cfg (ALWAYS ON): scoring always uses judge model now.
@@ -1184,7 +1184,7 @@ def main():
         "judge_temperature": (
             args.judge_temperature if args.judge_temperature is not None else cfg.get("judge", {}).get("temperature", 0.0)
         ),
-        "judge_max_tokens": (args.judge_max_tokens if args.judge_max_tokens is not None else cfg.get("judge", {}).get("max_tokens", 256)),
+        "judge_max_tokens": (args.judge_max_tokens if args.judge_max_tokens is not None else cfg.get("judge", {}).get("max_tokens", 10000)),
     }
     if not judge_dict["judge_model"]:
         raise ValueError("Missing judge model name: --judge-name or judge.model in YAML (or model.model as fallback).")
@@ -1198,7 +1198,7 @@ def main():
         model=judge_dict["judge_model"],
         timeout_s=float(judge_dict.get("judge_timeout_s", 60.0)),
         temperature=float(judge_dict.get("judge_temperature", 0.0)),
-        max_tokens=int(judge_dict.get("judge_max_tokens", 256)),
+        max_tokens=int(judge_dict.get("judge_max_tokens", 10000)),
     )
 
     # Concurrency: split quotas (pipeline). If not set, fall back to legacy --concurrency / YAML 'concurrency'.
