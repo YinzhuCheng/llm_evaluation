@@ -3,8 +3,8 @@
 本文档说明如何运行 `eval_mcq.py` 并正确配置参数。
 
 **重要说明（必须看）**：
-- **对于非选择题（例如填空/问答题），本代码采用 LLM 作为裁判（LLM-as-a-judge）来判定对错**。
-- **对于选择题（`Question_Type == "Multiple Choice"`），本代码采用规则提取 A-E 选项并与标准答案集合比对**。
+- **本代码对所有题型（包括选择题与非选择题）统一采用 LLM 作为裁判（LLM-as-a-judge）来判定对错**。
+- **不再使用本地“规则提取/字符串匹配”逻辑作为最终得分依据**（日志中可能仍会保留提取字段用于排查）。
 
 ---
 
@@ -41,14 +41,14 @@ python eval_mcq.py \
 ```
 
 ### 3) 裁判模型（Judge）开关与配置（非选择题必读）
-- **`--judge-enable`**：开启裁判模型。
-- **裁判模型只会用于非选择题**（即 `Question_Type != "Multiple Choice"`）。
-- 若你的数据集中包含填空/问答题，建议**务必开启**裁判模型，否则非选择题会出现 `judge_correct=None`，无法形成最终准确率统计。
+- **裁判模型现在默认始终启用，并用于所有题型评分**。
+- `--judge-enable` 仅作为历史参数保留（兼容旧命令行），即使不传也会启用裁判评分。
+- 如果你不单独配置 Judge，则会**默认使用被测模型的配置作为裁判**（同 provider/base_url/api_key/model）。
 
-裁判相关参数（与 model 类似）：
+裁判相关参数（与 model 类似，可单独指定裁判模型）：
 - **`--judge-provider`**、**`--judge-base-url`**、**`--judge-name`**、**`--judge-api-key`**
 
-示例（同一个模型既当作被测模型，也当裁判）：
+示例（同一个模型既当作被测模型，也当裁判；你也可以不传任何 `--judge-*` 参数走默认兜底）：
 
 ```bash
 python eval_mcq.py \
@@ -95,9 +95,9 @@ python eval_mcq.py \
 
 ### 1) `--cot`（影响选择题输出格式约束）
 - **`--cot off`（默认）**：要求模型**只输出** `A` 或 `A,B,C`（严格，不允许多余文字）。
-- **`--cot on`**：允许模型先写推理，但**最后一行必须严格为**：`Answer:A,B,C`
+- **`--cot on`**：允许模型先写推理，但**最后一行必须严格为**：`Answer:A,B,C`（仅此一行、无额外文本）。同时答案提取在该模式下会变得更严格：**只认最后一行的 `Answer:`/`答案:`**，避免从推理中误提取 A/B/C。
 
-> 该参数主要影响选择题答案提取规则；非选择题依然会把模型输出作为 `Model Answer` 交给裁判模型判定。
+> 该参数主要影响选择题的回答格式约束与（日志用的）答案提取规则；最终得分统一由裁判模型的 `judge_correct` 决定。
 
 ### 2) 并发与重试（稳定性/速度）
 - **`--concurrency`**：并发请求数，默认 8
@@ -173,5 +173,5 @@ python eval_mcq.py --config config.yaml
 
 在 `--out-dir` 下会生成：
 - `results_*.jsonl`：逐题完整日志（包含 model/judge 调用的脱敏请求结构与响应摘要）
-- `summary.json`：整体统计（包含选择题 rule_accuracy、裁判 judge_accuracy、以及最终 overall_accuracy）
+- `summary.json`：整体统计（最终口径为裁判模型评分；选择题/非选择题不再分开用不同判分规则）
 - `evaluated_*.xlsx`：把逐题 `model_correct` 写回到 Excel

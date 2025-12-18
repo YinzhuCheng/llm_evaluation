@@ -19,8 +19,11 @@ import yaml
 # ----------------------------
 
 LETTER_RE = re.compile(r"\b([A-E])\b", re.IGNORECASE)
-# For COT mode: extract from a dedicated final line
-FINAL_ANSWER_RE = re.compile(r"(?im)^\s*(?:final\s*)?answer\s*[:：]\s*([A-E](?:\s*,\s*[A-E])*)\s*$")
+# For COT mode: extract from a dedicated final line.
+# Accept both English and Chinese tags (Answer/答案) and both ':' / '：'.
+FINAL_ANSWER_RE = re.compile(
+    r"(?im)^\s*(?:final\s*)?(?:answer|答案)\s*[:：]\s*([A-E](?:\s*,\s*[A-E])*)\s*$"
+)
 
 RETRIABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
@@ -140,22 +143,41 @@ def extract_answer_from_text(text: str, cot_on: bool) -> Optional[str]:
         return None
 
     if cot_on:
+        # In COT mode we MUST avoid accidental extraction from the reasoning
+        # (A/B/C frequently appear in explanations). Only accept the dedicated final line.
         m = FINAL_ANSWER_RE.search(text)
         if m:
             norm = normalize_csv_letters(m.group(1))
             return norm if norm else None
-
-        # fallback: try last non-empty line
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if lines:
-            last = lines[-1]
-            norm = normalize_csv_letters(last)
-            if norm:
-                return norm
+        return None
 
     raw = extract_letters_csv(text)
     norm = normalize_csv_letters(raw or "")
     return norm if norm else None
+
+
+def is_multiple_choice(question_type_raw: str, options: List[str]) -> bool:
+    """
+    Robust question type detection.
+    - Prefer explicit Question_Type when provided
+    - Fallback to presence of options (common when Question_Type is missing/dirty)
+    """
+    qt = str(question_type_raw or "").strip().lower()
+    if qt:
+        # English variants
+        if qt in {"multiple choice", "mcq", "multi-choice", "multichoice", "single choice", "single-choice"}:
+            return True
+        if "multiple choice" in qt or (("choice" in qt) and ("freeform" not in qt) and ("fill" not in qt)):
+            return True
+        # Chinese variants (best-effort)
+        if any(k in qt for k in ["选择题", "单选", "多选"]):
+            return True
+
+    # Fallback: if options exist, treat as MCQ.
+    # This is intentionally permissive to avoid sending MCQ to freeform judging prompts.
+    if isinstance(options, list) and len([o for o in options if str(o).strip()]) >= 2:
+        return True
+    return False
 
 
 def _sanitize_call_for_logging(provider: str, call_obj: Optional[Dict[str, Any]], image_path: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -543,21 +565,21 @@ def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
             "Output format rules (STRICT):\n"
             "1) Output ONLY option letters among A,B,C,D,E.\n"
             "2) If multiple, separate by comma ',' with NO spaces. Example: A,B,C\n"
-            "3) Do not output any other characters, words, punctuation, or spaces.\n\n"
+            "3) Output EXACTLY ONE LINE and NOTHING ELSE (no reasoning, no punctuation, no spaces).\n\n"
             f"Question:\n{question}\n\n"
             f"Options:\n{opts}\n"
         )
 
     return (
         "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
-        "You may provide reasoning, but you MUST follow the output rules.\n"
-        "Output rules:\n"
-        "1) You may write reasoning first.\n"
-        "2) On the LAST line, output the final answer in EXACT format:\n"
+        "You may provide short reasoning, but you MUST follow the output rules exactly.\n"
+        "Output rules (COT mode):\n"
+        "1) You may write reasoning first (any format), but avoid repeating the full options.\n"
+        "2) The LAST line MUST be EXACTLY one of the following forms (no extra text):\n"
+        "   Answer:A\n"
         "   Answer:A,B,C\n"
-        "   - Use ONLY letters among A,B,C,D,E\n"
-        "   - If multiple, separate by comma ',' with NO spaces\n"
-        "   - Do not output anything after that line\n\n"
+        "   (use ONLY letters among A,B,C,D,E; comma ',' with NO spaces)\n"
+        "3) Do NOT output anything after the last line.\n\n"
         f"Question:\n{question}\n\n"
         f"Options:\n{opts}\n"
     )
@@ -580,6 +602,41 @@ def build_freeform_judge_prompt(question: str, model_answer: str, gold: str) -> 
     )
 
 
+def build_mcq_judge_prompt(
+    question: str,
+    options: List[str],
+    model_answer: str,
+    gold_letters_csv: str,
+) -> str:
+    """
+    Judge prompt for MCQ. The judge should decide correctness based on whether the set
+    of chosen option letters exactly matches the gold (order-insensitive, duplicates ignored).
+    """
+    opts = "\n".join(options or [])
+    return (
+        "You are a strict evaluator for a multiple-choice question. Some questions may have multiple correct options.\n"
+        "Your task: decide whether the model answer is correct.\n"
+        "Correctness rule:\n"
+        "- Extract the option letters chosen by the model (A-E).\n"
+        "- Treat answers as a SET (order-insensitive; duplicates ignored).\n"
+        "- The answer is correct ONLY IF the extracted set exactly equals the gold set.\n\n"
+        "Return ONLY a JSON object. No markdown, no extra text.\n"
+        "The JSON schema is:\n"
+        "{\n"
+        '  "verdict": "correct" | "incorrect" | "unjudgeable",\n'
+        '  "extracted_answer": string|null,\n'
+        '  "reason": string\n'
+        "}\n"
+        'Notes:\n'
+        '- If you can extract letters, set extracted_answer to a normalized CSV like "A" or "A,B,C" (no spaces).\n'
+        '- If the model does not provide a usable answer, set verdict="unjudgeable".\n\n'
+        f"Question:\n{question}\n\n"
+        f"Options:\n{opts}\n\n"
+        f"Gold Answer (letters CSV):\n{gold_letters_csv}\n\n"
+        f"Model Answer:\n{model_answer}\n"
+    )
+
+
 
 
 
@@ -592,8 +649,17 @@ def parse_judge_json(text: str) -> Dict[str, Any]:
     """
     text = (text or "").strip()
     try:
-        # 解析裁判模型返回的 JSON
-        judge_json = json.loads(text)
+        # Best-effort: some models may wrap JSON with extra text/codefences.
+        candidate = text
+        if "```" in candidate:
+            candidate = re.sub(r"(?s)^```(?:json)?\s*|\s*```$", "", candidate.strip()).strip()
+        if not candidate.startswith("{"):
+            start = candidate.find("{")
+            end = candidate.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                candidate = candidate[start : end + 1]
+
+        judge_json = json.loads(candidate)
 
         # 解析 "verdict" 字段
         verdict = judge_json.get("verdict", "").lower()
@@ -630,13 +696,11 @@ async def eval_one(
     qid = str(row.get("id", "")).strip()
     question = str(row.get("Question", "")).strip()
     options = load_options(row.get("Options", ""))  # 获取选项
-    question_type = str(row.get("Question_Type", "")).strip()  # 获取题目类型
+    question_type_raw = str(row.get("Question_Type", "")).strip()  # 获取题目类型（原始）
+    mcq = is_multiple_choice(question_type_raw, options)
 
-    gold_raw = str(row.get("Answer", "")).strip().upper()
-    if question_type == "Multiple Choice":
-        gold_norm = normalize_csv_letters(gold_raw)  # 仅在选择题中进行标准化
-    else:
-        gold_norm = gold_raw  # 对于填空题，直接使用 gold_raw
+    gold_raw = str(row.get("Answer", "")).strip()
+    gold_norm = normalize_csv_letters(gold_raw) if mcq else gold_raw
 
     img_rel = str(row.get("Image", "") or "").strip()
     img_dep = int(row.get("Image_Dependency", 0) or 0)
@@ -665,7 +729,7 @@ async def eval_one(
             "gold": gold_norm,
             "pred_raw": None,
             "pred": None,
-            "rule_correct": False,
+            "rule_correct": None,
             "judge_correct": None,
             "latency_ms": 0,
             "image_path": image_path,
@@ -677,16 +741,14 @@ async def eval_one(
         print(f"[{idx}/{total}] id={qid}  SKIP(image missing)  gold={gold_norm}  image={img_rel}", flush=True)
         return out
 
-    if question_type == "Multiple Choice":
-        # 选择题直接判断
+    if mcq:
         prompt = build_mcq_prompt(question, options, cot_on=cot_on)
     else:
-        # 填空题使用裁判判断
         prompt = f"Answer the following question:\n\n{question}\n\nProvide a complete and accurate answer:"
 
     # Real-time: start
     print(
-        f"[{idx}/{total}] id={qid}  START  gold={gold_norm}  img_dep={img_dep}  img={'yes' if bool(image_data_url) else 'no'}  cot={run_cfg.cot}",
+        f"[{idx}/{total}] id={qid}  START  gold={gold_norm}  img_dep={img_dep}  img={'yes' if bool(image_data_url) else 'no'}  cot={run_cfg.cot}  mcq={mcq}",
         flush=True
     )
 
@@ -698,23 +760,17 @@ async def eval_one(
     model_text = extract_text_from_provider_response(model_provider.cfg.provider, model_call.get("response"))
     model_call_log = _sanitize_call_for_logging(model_provider.cfg.provider, model_call, image_path)
 
-    # 选择题与填空题的处理逻辑不同
-    if question_type == "Multiple Choice":
-        # 对选择题进行判断
-        pred_norm = extract_answer_from_text(model_text, cot_on=cot_on)  # 选择题的答案提取
-        rule_correct = (csv_to_set(pred_norm) == csv_to_set(gold_norm)) if pred_norm and gold_norm else False
+    # We keep an extracted prediction for logging/debugging only.
+    # IMPORTANT: scoring is ALWAYS performed by the judge model (no local matching logic).
+    if mcq:
+        pred_norm = extract_answer_from_text(model_text, cot_on=cot_on)  # may be None in COT mode if format violated
     else:
-        # 填空题直接使用模型返回的文本作为答案，裁判模型判断是否正确
-        pred_norm = model_text.strip()  # 填空题直接使用模型返回的文本作为答案
-        rule_correct = None  # 用裁判模型来判断是否正确
+        pred_norm = model_text.strip()
+    rule_correct = None
 
     pred_raw = pred_norm  # keep compatible field meaning
 
-    if question_type == "Multiple Choice":
-        ok = "✅" if rule_correct else "❌"
-    else:
-        # 对于填空题，rule_correct 不适用，设置为 None
-        ok = "N/A"  # 填空题使用 "N/A" 或其他占位符表示不适用
+    ok = "N/A"
 
     preview = (model_text or "").replace("\n", " ").strip()
     if len(preview) > 200:
@@ -730,10 +786,13 @@ async def eval_one(
     judge_correct = None
     judge_call_log = None
 
-    # 仅针对填空题使用裁判模型
-    if judge_provider is not None and question_type != "Multiple Choice":
-        # 裁判模型逻辑
-        judge_prompt = build_freeform_judge_prompt(question, model_text, gold_raw)
+    # ALWAYS use judge model for scoring (all question types).
+    if judge_provider is not None:
+        judge_prompt = (
+            build_mcq_judge_prompt(question, options, model_text, gold_norm)
+            if mcq
+            else build_freeform_judge_prompt(question, model_text, gold_raw)
+        )
         async with sem:
             jt0 = now_ms()
             judge_call = await judge_provider.call(prompt=judge_prompt, image_data_url=image_data_url)
@@ -782,6 +841,8 @@ async def eval_one(
         "latency_ms": t1 - t0,
         "question": question,
         "options": options,
+        "question_type_raw": question_type_raw,
+        "question_type_inferred": "Multiple Choice" if mcq else "Freeform",
         "image_path": image_path,
         # Keep a compact image reference; do NOT log base64.
         "image_data_url": image_path if image_path else None,
@@ -837,41 +898,24 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     ]
     results = await asyncio.gather(*tasks)
 
-    # Add a column for model correctness
-    # 计算每题最终是否正确：选择题用 rule_correct，填空题用 judge_correct
-    # ============= NEW METRICS (replace old accuracy metrics) =============
+    # Final correctness is ALWAYS determined by judge_correct for ALL question types.
+    # ============= METRICS (judge-only) =============
     overall_total = 0
     overall_correct = 0
-
-    mc_total = 0
-    mc_correct = 0
-
-    non_mc_total = 0
-    non_mc_correct = 0
+    judged_total = 0
+    judged_correct = 0
 
     for result, row in zip(results, rows):
         if result.get("skipped"):
             row["model_correct"] = None
             continue
 
-        qtype = str(row.get("Question_Type", "")).strip()
-
-        if qtype == "Multiple Choice":
-            final_correct = (result.get("rule_correct") is True)
-            mc_total += 1
-            if final_correct:
-                mc_correct += 1
-            # 写回表格：选择题用 rule_correct（True/False）
-            row["model_correct"] = result.get("rule_correct")
-
-        else:
-            # 非选择题：只把 judge_correct == True 视为正确
-            final_correct = (result.get("judge_correct") is True)
-            non_mc_total += 1
-            if final_correct:
-                non_mc_correct += 1
-            # 写回表格：保留 judge_correct（True/False/None）方便排查
-            row["model_correct"] = result.get("judge_correct")
+        final_correct = (result.get("judge_correct") is True)
+        judged_total += 1
+        if final_correct:
+            judged_correct += 1
+        # 写回表格：统一用 judge_correct（True/False/None）
+        row["model_correct"] = result.get("judge_correct")
 
         overall_total += 1
         if final_correct:
@@ -882,8 +926,7 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
         return f"{correct}/{total} ({pct:.2f}%)"
 
     overall_score_str = _fmt_score(overall_correct, overall_total)
-    mc_score_str = _fmt_score(mc_correct, mc_total)
-    non_mc_score_str = _fmt_score(non_mc_correct, non_mc_total)
+    judged_score_str = _fmt_score(judged_correct, judged_total)
     # =====================================================================
 
     # Save results to a new Excel file
@@ -920,15 +963,10 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
             "total": overall_total,
             "score": overall_score_str,
         },
-        "multiple_choice": {
-            "correct": mc_correct,
-            "total": mc_total,
-            "score": mc_score_str,
-        },
-        "non_multiple_choice": {
-            "correct": non_mc_correct,
-            "total": non_mc_total,
-            "score": non_mc_score_str,
+        "judged": {
+            "correct": judged_correct,
+            "total": judged_total,
+            "score": judged_score_str,
         },
 
         "timestamp_ms": now_ms(),
@@ -954,8 +992,7 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
 
     print("\n=== Scores ===", flush=True)
     print(f"Overall: {overall_score_str}", flush=True)
-    print(f"Multiple Choice: {mc_score_str}", flush=True)
-    print(f"Non-Multiple Choice: {non_mc_score_str}", flush=True)
+    print(f"Judged (all questions): {judged_score_str}", flush=True)
 
     print(f"\nSaved full archives to: {results_path}", flush=True)
     print(f"Saved summary to: {summary_path}", flush=True)
@@ -1017,7 +1054,8 @@ def main():
     ap.add_argument("--model-max-tokens", type=int, default=256)
 
     # judge
-    ap.add_argument("--judge-enable", action="store_true")
+    ap.add_argument("--judge-enable", action="store_true",
+                    help="(legacy) Kept for backward compatibility; scoring always uses judge now.")
     ap.add_argument("--judge-provider", type=str, default="")
     ap.add_argument("--judge-base-url", type=str, default="")
     ap.add_argument("--judge-api-key", type=str, default="")
@@ -1079,31 +1117,36 @@ def main():
         max_tokens=int(model_dict_for_builder.get("model_max_tokens", 256)),
     )
 
-    # judge cfg
-    judge_cfg = None
-    judge_enable = bool(args.judge_enable or cfg.get("judge", {}).get("enable", False))
-    if judge_enable:
-        judge_dict = {
-            "judge_provider": args.judge_provider or cfg.get("judge", {}).get("provider", model_cfg.provider),
-            "judge_base_url": args.judge_base_url or cfg.get("judge", {}).get("base_url", model_cfg.base_url),
-            "judge_api_key": args.judge_api_key or cfg.get("judge", {}).get("api_key", model_dict["model_api_key"]),
-            "judge_model": args.judge_name or cfg.get("judge", {}).get("model", model_cfg.model),
-            "judge_timeout_s": args.judge_timeout_s or cfg.get("judge", {}).get("timeout_s", 60.0),
-            "judge_temperature": args.judge_temperature if args.judge_temperature is not None else cfg.get("judge", {}).get("temperature", 0.0),
-            "judge_max_tokens": args.judge_max_tokens or cfg.get("judge", {}).get("max_tokens", 256),
-        }
-        if not judge_dict["judge_model"]:
-            raise ValueError("Judge enabled but judge model name missing: --judge-name or judge.model in YAML.")
+    # judge cfg (ALWAYS ON): scoring always uses judge model now.
+    judge_dict = {
+        "judge_provider": args.judge_provider or cfg.get("judge", {}).get("provider", model_cfg.provider),
+        "judge_base_url": args.judge_base_url or cfg.get("judge", {}).get("base_url", model_cfg.base_url),
+        "judge_api_key": (
+            args.judge_api_key
+            or cfg.get("judge", {}).get("api_key", "")
+            or model_dict.get("model_api_key", "")
+        ),
+        "judge_model": args.judge_name or cfg.get("judge", {}).get("model", model_cfg.model),
+        "judge_timeout_s": args.judge_timeout_s or cfg.get("judge", {}).get("timeout_s", 60.0),
+        "judge_temperature": (
+            args.judge_temperature if args.judge_temperature is not None else cfg.get("judge", {}).get("temperature", 0.0)
+        ),
+        "judge_max_tokens": args.judge_max_tokens or cfg.get("judge", {}).get("max_tokens", 256),
+    }
+    if not judge_dict["judge_model"]:
+        raise ValueError("Missing judge model name: --judge-name or judge.model in YAML (or model.model as fallback).")
+    if not judge_dict["judge_api_key"] and judge_dict["judge_provider"].lower() != "gemini":
+        raise ValueError("Missing judge api key: --judge-api-key or judge.api_key in YAML (or model api key fallback).")
 
-        judge_cfg = ProviderConfig(
-            provider=judge_dict["judge_provider"],
-            base_url=judge_dict["judge_base_url"],
-            api_key=judge_dict["judge_api_key"],
-            model=judge_dict["judge_model"],
-            timeout_s=float(judge_dict.get("judge_timeout_s", 60.0)),
-            temperature=float(judge_dict.get("judge_temperature", 0.0)),
-            max_tokens=int(judge_dict.get("judge_max_tokens", 256)),
-        )
+    judge_cfg = ProviderConfig(
+        provider=judge_dict["judge_provider"],
+        base_url=judge_dict["judge_base_url"],
+        api_key=judge_dict["judge_api_key"],
+        model=judge_dict["judge_model"],
+        timeout_s=float(judge_dict.get("judge_timeout_s", 60.0)),
+        temperature=float(judge_dict.get("judge_temperature", 0.0)),
+        max_tokens=int(judge_dict.get("judge_max_tokens", 256)),
+    )
 
     run_cfg = RunConfig(
         input_path=input_path,
