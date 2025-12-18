@@ -316,7 +316,7 @@ class ProviderConfig:
     model: str
     timeout_s: float = 60.0
     temperature: float = 0.0
-    max_tokens: int = 512
+    max_tokens: int = 10000
 
 @dataclass
 class RunConfig:
@@ -1055,7 +1055,7 @@ def build_provider_cfg(d: Dict[str, Any], prefix: str) -> ProviderConfig:
     model = d[f"{prefix}_model"]
     timeout_s = float(d.get(f"{prefix}_timeout_s", 60.0))
     temperature = float(d.get(f"{prefix}_temperature", 0.0))
-    max_tokens = int(d.get(f"{prefix}_max_tokens", 512))
+    max_tokens = int(d.get(f"{prefix}_max_tokens", 10000))
     return ProviderConfig(
         provider=provider,
         base_url=base_url,
