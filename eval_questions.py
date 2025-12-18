@@ -30,6 +30,25 @@ RETRIABLE_STATUS = {408, 429, 500, 502, 503, 504}
 def now_ms() -> int:
     return int(time.time() * 1000)
 
+_DATA_URL_B64_RE = re.compile(
+    r"data:(?:image|application|text)/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{40,}",
+    re.IGNORECASE,
+)
+# Generic "very long base64-like token" safeguard, to prevent sending huge blobs to judge.
+_LONG_B64_TOKEN_RE = re.compile(r"\b[A-Za-z0-9+/]{200,}={0,2}\b")
+
+def strip_base64_payloads(text: str) -> str:
+    """
+    Remove/shorten base64 payloads from text BEFORE sending to judge.
+    This is best-effort and intentionally conservative.
+    """
+    if not text:
+        return ""
+    s = str(text)
+    s = _DATA_URL_B64_RE.sub("data:<omitted>;base64,<omitted>", s)
+    s = _LONG_B64_TOKEN_RE.sub("<base64_omitted>", s)
+    return s
+
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -170,6 +189,76 @@ def extract_answer_from_text(text: str, cot_on: bool) -> Optional[str]:
     raw = extract_letters_csv(text)
     norm = normalize_csv_letters(raw or "")
     return norm if norm else None
+
+
+def _strip_markdown_code_fences(s: str) -> str:
+    s = (s or "").strip()
+    if "```" not in s:
+        return s
+    # Remove outermost code fences if present
+    return re.sub(r"(?s)^\s*```(?:json)?\s*|\s*```\s*$", "", s).strip()
+
+
+def extract_first_json_object(s: str) -> Optional[str]:
+    """
+    Best-effort extraction of the first JSON object from text.
+    We still require json.loads() to succeed afterwards.
+    """
+    if not s:
+        return None
+    candidate = _strip_markdown_code_fences(s).strip()
+    if candidate.startswith("{") and candidate.endswith("}"):
+        return candidate
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return candidate[start : end + 1].strip()
+    return None
+
+
+def parse_answer_json(text: str, *, mcq: bool) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Parse answering-model output as a strict JSON object.
+    Required: {"answer": ...}
+    - MCQ: answer can be "A,B" or ["A","B"] (normalized to "A,B")
+    - Freeform: answer can be string/number/boolean/list[string] (cast to string; list joined by newlines)
+    """
+    raw = (text or "").strip()
+    candidate = extract_first_json_object(raw)
+    if not candidate:
+        return None, "no_json_object_found"
+    try:
+        obj = json.loads(candidate)
+    except Exception as e:
+        return None, f"json_parse_error: {type(e).__name__}: {e}"
+    if not isinstance(obj, dict):
+        return None, "json_not_object"
+    if "answer" not in obj:
+        return None, "missing_answer_field"
+
+    ans = obj.get("answer")
+    if mcq:
+        if isinstance(ans, list):
+            joined = ",".join([str(x) for x in ans if str(x).strip()])
+            norm = normalize_csv_letters(joined)
+        else:
+            norm = normalize_csv_letters(str(ans or ""))
+        if not norm:
+            return None, "empty_or_unparseable_mcq_answer"
+        obj["answer"] = norm
+        return obj, None
+
+    if ans is None:
+        return None, "empty_answer"
+    if isinstance(ans, list):
+        parts = [str(x).strip() for x in ans if str(x).strip()]
+        ans_s = "\n".join(parts).strip()
+    else:
+        ans_s = str(ans).strip()
+    if not ans_s:
+        return None, "empty_answer"
+    obj["answer"] = ans_s
+    return obj, None
 
 
 def is_multiple_choice(question_type_raw: str, options: List[str]) -> bool:
@@ -335,6 +424,9 @@ class RunConfig:
 
     # NEW: cot switch
     cot: str = "off"  # on/off
+
+    # NEW: answering-model JSON enforcement retries (content-level, not HTTP retries)
+    answer_json_max_attempts: int = 3
 
     # vpn/proxy switch
     vpn: str = "off"       # on/off
@@ -577,47 +669,50 @@ def extract_text_from_provider_response(provider: str, resp_json: Any) -> str:
 def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
     opts = "\n".join(options)
 
-    if not cot_on:
-        return (
-            "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
-            "Output format rules (STRICT):\n"
-            "1) Output ONLY option letters among A,B,C,D,E.\n"
-            "2) If multiple, separate by comma ',' with NO spaces. Example: A,B,C\n"
-            "3) Output EXACTLY ONE LINE and NOTHING ELSE (no reasoning, no punctuation, no spaces).\n\n"
-            f"Question:\n{question}\n\n"
-            f"Options:\n{opts}\n"
-        )
-
+    # Always enforce JSON output to reduce judge tokens and prevent CoT leakage.
     return (
         "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
         "You may think step-by-step internally, but you MUST NOT output chain-of-thought.\n"
-        "Output format rules (COT mode, STRICT):\n"
+        "Output format rules (STRICT):\n"
         "- Return ONLY a JSON object. No markdown. No extra text.\n"
         "- JSON schema:\n"
-        '{ "answer": "A" | "A,B,C", "brief_reason": string }\n'
+        '{ "answer": "A" | "A,B,C" }\n'
         "- 'answer' must contain ONLY letters among A,B,C,D,E.\n"
         "- If multiple, separate by comma ',' with NO spaces (example: \"A,B,C\").\n"
-        "- 'brief_reason' should be short (1-3 sentences).\n"
         "Example:\n"
-        '{ "answer": "B", "brief_reason": "A 4g-gon is the standard fundamental polygon for genus g." }\n\n'
+        '{ "answer": "B" }\n\n'
         f"Question:\n{question}\n\n"
         f"Options:\n{opts}\n"
     )
 
 
 def build_freeform_answer_prompt(question: str, cot_on: bool) -> str:
-    if not cot_on:
-        return f"Answer the following question:\n\n{question}\n\nProvide a complete and accurate answer:"
+    # Always enforce JSON output to reduce judge tokens and prevent CoT leakage.
     return (
         "Answer the following question.\n"
         "You may think step-by-step internally, but you MUST NOT output chain-of-thought.\n"
-        "Output format rules (COT mode, STRICT):\n"
+        "Output format rules (STRICT):\n"
         "- Return ONLY a JSON object. No markdown. No extra text.\n"
         "- JSON schema:\n"
-        '{ "answer": string, "brief_reason": string }\n'
+        '{ "answer": string | number | boolean | list[string] }\n'
         "- 'answer' must be the final result only (concise, no derivations).\n"
-        "- 'brief_reason' should be short (1-3 sentences).\n\n"
+        "- For fill-in with multiple blanks, you may output a list of strings.\n\n"
         f"Question:\n{question}\n"
+    )
+
+
+def build_answer_json_retry_prefix(attempt_idx: int, last_error: str) -> str:
+    """
+    Content-level retry prefix when the answering model fails to output valid JSON.
+    attempt_idx is 2..N (human-friendly).
+    """
+    err = (last_error or "").strip()
+    return (
+        "IMPORTANT: Your previous response was NOT valid JSON and could not be parsed.\n"
+        f"Failure reason: {err}\n"
+        "You MUST respond with ONLY a single JSON object, matching the required schema.\n"
+        "Do NOT include markdown fences. Do NOT include any extra text before or after the JSON.\n"
+        f"(Retry attempt {attempt_idx})\n\n"
     )
 
 def build_freeform_judge_prompt(question: str, model_answer: str, gold: str) -> str:
@@ -639,17 +734,11 @@ def build_freeform_judge_prompt(question: str, model_answer: str, gold: str) -> 
     )
 
 
-def build_mcq_judge_prompt(
-    question: str,
-    options: List[str],
-    model_answer: str,
-    gold_letters_csv: str,
-) -> str:
+def build_mcq_judge_prompt_minimal(model_answer: str, gold_letters_csv: str) -> str:
     """
-    Judge prompt for MCQ. The judge should decide correctness based on whether the set
-    of chosen option letters exactly matches the gold (order-insensitive, duplicates ignored).
+    Judge prompt for MCQ WITHOUT question/options to save tokens.
+    Decide correctness based on whether the set of chosen letters exactly matches the gold.
     """
-    opts = "\n".join(options or [])
     return (
         "You are a strict evaluator for a multiple-choice question. Some questions may have multiple correct options.\n"
         "Your task: decide whether the model answer is correct.\n"
@@ -667,8 +756,6 @@ def build_mcq_judge_prompt(
         'Notes:\n'
         '- If you can extract letters, set extracted_answer to a normalized CSV like "A" or "A,B,C" (no spaces).\n'
         '- If the model does not provide a usable answer, set verdict="unjudgeable".\n\n'
-        f"Question:\n{question}\n\n"
-        f"Options:\n{opts}\n\n"
         f"Gold Answer (letters CSV):\n{gold_letters_csv}\n\n"
         f"Model Answer:\n{model_answer}\n"
     )
@@ -779,42 +866,64 @@ async def eval_one(
         print(f"[{idx}/{total}] id={qid}  SKIP(image missing)  gold={gold_norm}  image={img_rel}", flush=True)
         return out
 
-    if mcq:
-        prompt = build_mcq_prompt(question, options, cot_on=cot_on)
-    else:
-        prompt = build_freeform_answer_prompt(question, cot_on=cot_on)
+    base_prompt = build_mcq_prompt(question, options, cot_on=cot_on) if mcq else build_freeform_answer_prompt(question, cot_on=cot_on)
 
-    async with model_sem:
-        t0 = now_ms()
-        model_call = await model_provider.call(prompt=prompt, image_data_url=image_data_url)
-        t1 = now_ms()
+    # ---- Answering model: enforce JSON, retry up to N times (content-level) ----
+    model_call = None
+    model_text = ""
+    model_call_log = None
+    answer_obj: Optional[Dict[str, Any]] = None
+    answer_parse_error: Optional[str] = None
+    answer_attempts = 0
 
-    model_text = extract_text_from_provider_response(model_provider.cfg.provider, model_call.get("response"))
-    model_call_log = _sanitize_call_for_logging(model_provider.cfg.provider, model_call, image_path)
+    t0 = now_ms()
+    for k in range(max(1, int(run_cfg.answer_json_max_attempts))):
+        answer_attempts = k + 1
+        prompt = base_prompt
+        if k > 0:
+            prompt = build_answer_json_retry_prefix(k + 1, answer_parse_error or "unknown") + base_prompt
 
-    # We do not rely on local extraction for scoring anymore.
-    # Keep a best-effort extracted value for debugging only (may be None).
-    pred_extracted_debug = extract_answer_from_text(model_text, cot_on=cot_on) if mcq else None
+        async with model_sem:
+            model_call = await model_provider.call(prompt=prompt, image_data_url=image_data_url)
+
+        model_text = extract_text_from_provider_response(model_provider.cfg.provider, (model_call or {}).get("response"))
+        model_call_log = _sanitize_call_for_logging(model_provider.cfg.provider, model_call, image_path)
+
+        answer_obj, answer_parse_error = parse_answer_json(model_text, mcq=mcq)
+        if answer_obj is not None:
+            answer_parse_error = None
+            break
+    t1 = now_ms()
+
+    extracted_final_answer: Optional[str] = None
+    if answer_obj is not None:
+        extracted_final_answer = str(answer_obj.get("answer", "")).strip()
     rule_correct = None
     judge_call = None
     judge_block = None
     judge_correct = None
     judge_call_log = None
 
-    # ALWAYS use judge model for scoring (all question types).
-    if judge_provider is not None:
-        judge_prompt = (
-            build_mcq_judge_prompt(question, options, model_text, gold_norm)
-            if mcq
-            else build_freeform_judge_prompt(question, model_text, gold_raw)
-        )
+    # ALWAYS use judge model for scoring (all question types), but send only minimal content.
+    # - MCQ: send gold + extracted answer ONLY (no question/options)
+    # - Freeform: send question + gold + extracted answer, and strip base64 blobs
+    if judge_provider is not None and extracted_final_answer is not None:
+        if mcq:
+            judge_prompt = build_mcq_judge_prompt_minimal(extracted_final_answer, gold_norm)
+        else:
+            q_clean = strip_base64_payloads(question)
+            gold_clean = strip_base64_payloads(gold_raw)
+            ans_clean = strip_base64_payloads(extracted_final_answer)
+            judge_prompt = build_freeform_judge_prompt(q_clean, ans_clean, gold_clean)
+
         async with judge_sem:
             jt0 = now_ms()
-            judge_call = await judge_provider.call(prompt=judge_prompt, image_data_url=image_data_url)
+            # IMPORTANT: do NOT send image/base64 to judge
+            judge_call = await judge_provider.call(prompt=judge_prompt, image_data_url=None)
             jt1 = now_ms()
 
-        judge_text = extract_text_from_provider_response(judge_provider.cfg.provider, judge_call.get("response"))
-        judge_call_log = _sanitize_call_for_logging(judge_provider.cfg.provider, judge_call, image_path)
+        judge_text = extract_text_from_provider_response(judge_provider.cfg.provider, (judge_call or {}).get("response"))
+        judge_call_log = _sanitize_call_for_logging(judge_provider.cfg.provider, judge_call, image_path=None)
         judge_json = parse_judge_json(judge_text)
         verdict = str(judge_json.get("verdict", "unjudgeable")).lower()
 
@@ -834,18 +943,8 @@ async def eval_one(
             "judge_json": judge_json,
             "judge_latency_ms": jt1 - jt0,
         }
-
-    # Prefer judge-extracted answer as the prediction shown in logs/Excel.
-    judge_extracted_for_pred: Optional[str] = None
-    if isinstance(judge_block, dict):
-        jj = judge_block.get("judge_json") or {}
-        if isinstance(jj, dict):
-            if mcq:
-                v = jj.get("extracted_answer_normalized")
-                judge_extracted_for_pred = v if isinstance(v, str) and v else None
-            else:
-                v = jj.get("extracted_answer")
-                judge_extracted_for_pred = v if isinstance(v, str) and v.strip() else None
+    else:
+        judge_correct = None
 
     out = {
         "id": qid,
@@ -855,11 +954,12 @@ async def eval_one(
         "skip_reason": None,
         "gold_raw": gold_raw,
         "gold": gold_norm,
-        # Use judge-extracted answer as the canonical prediction.
-        "pred_raw": judge_extracted_for_pred,
-        "pred": judge_extracted_for_pred,
-        # Keep debug extraction from model output for troubleshooting (not used for scoring).
-        "pred_extracted_debug": pred_extracted_debug,
+        # Canonical prediction is extracted from answering-model JSON (NOT judge extraction).
+        "pred_raw": extracted_final_answer,
+        "pred": extracted_final_answer,
+        "answer_json_ok": (answer_obj is not None),
+        "answer_json_attempts": answer_attempts,
+        "answer_json_error": answer_parse_error,
         "rule_correct": rule_correct,
         "judge_correct": judge_correct,
         "latency_ms": t1 - t0,
@@ -895,7 +995,7 @@ async def eval_one(
         judge_preview = judge_preview[:200] + "..."
 
     print(
-        f"[{idx}/{total}] id={qid}  DONE  mcq={mcq}  gold={gold_norm}  pred={judge_extracted_for_pred}  judge_correct={judge_correct}  model_ms={t1 - t0}  judge_ms={(out.get('judge_latency_ms') or 0)}  total_ms={out.get('total_latency_ms')}",
+        f"[{idx}/{total}] id={qid}  DONE  mcq={mcq}  gold={gold_norm}  pred={extracted_final_answer}  judge_correct={judge_correct}  model_ms={t1 - t0}  judge_ms={(out.get('judge_latency_ms') or 0)}  total_ms={out.get('total_latency_ms')}",
         flush=True
     )
     print(f"   model_text: {model_preview}", flush=True)
@@ -1091,6 +1191,13 @@ def main():
         help="COT mode: on=force JSON output (answer, brief_reason) with NO chain-of-thought; off=answer-only",
     )
 
+    ap.add_argument(
+        "--answer-json-max-attempts",
+        type=int,
+        default=None,
+        help="Max attempts to re-ask answering model when JSON parsing fails (content-level retries). Default: 3",
+    )
+
     # VPN/proxy switch
     ap.add_argument("--vpn", type=str, choices=["on", "off"], default=None,
                     help="VPN mode switch: on=use proxy, off=direct")
@@ -1220,6 +1327,11 @@ def main():
         skip_image_missing=True,
         limit=(args.limit if args.limit is not None else cfg.get("limit", None)),
         cot=(args.cot if args.cot is not None else cfg.get("cot", "off")),
+        answer_json_max_attempts=int(
+            args.answer_json_max_attempts
+            if args.answer_json_max_attempts is not None
+            else cfg.get("answer_json_max_attempts", 3)
+        ),
         vpn=(args.vpn if args.vpn is not None else cfg.get("vpn", "off")),
         proxy=args.proxy or cfg.get("proxy", ""),
     )

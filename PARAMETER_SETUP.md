@@ -4,6 +4,9 @@
 
 **重要说明（必须看）**：
 - **本代码对所有题型都采用 LLM 作为裁判（LLM-as-a-judge）来判定对错**（包括选择题）。最终写回到 Excel 的 `model_correct` 也统一来自裁判结果。
+- **为降低 token**：答题模型被要求输出**严格 JSON**，脚本会先本地解析出 `answer` 再交给裁判（不把完整输出/推理过程交给裁判）。
+- **选择题的裁判输入最小化**：裁判**只会看到标准答案选项**与**模型作答选项**（不再发送题干/选项文本）。
+- **非选择题不发图片给裁判**：即使题目依赖图片，裁判调用也**不会携带图片/base64**；同时会对发送给裁判的文本字段做 base64 片段清洗（防止超长 blob 进入裁判 prompt）。
 - **选择题识别是“鲁棒/宽松”的**：优先看 `Question_Type`（英文/中文多种写法均可），若 `Question_Type` 缺失或脏数据，则会退化为“只要 `Options` 里有 ≥2 个有效选项就当选择题”。
 
 ---
@@ -92,19 +95,17 @@ python eval_questions.py \
 
 ## 次要参数（可选/调优项）
 
-### 1) `--cot`（影响选择题输出格式约束）
-- **`--cot off`（默认）**：
-  - 选择题：要求模型**只输出** `A` 或 `A,B,C`（严格，不允许多余文字）。
-  - 非选择题：模型按正常文本回答（作为裁判的 `Model Answer` 输入）。
-- **`--cot on`**：
-  - 选择题与非选择题都会要求模型返回 **JSON**（不允许 markdown/额外文字），格式为：
-    - 选择题：`{ "answer": "A" | "A,B,C", "brief_reason": string }`
-    - 非选择题：`{ "answer": string, "brief_reason": string }`
-  - 注意：这里的 `brief_reason` 是简短解释（1-3 句），**不是 chain-of-thought**。
+### 1) `--cot`（兼容保留，当前不再影响输出格式）
+当前版本**始终**要求答题模型返回严格 JSON（只需 `answer` 字段），以便脚本先解析答案再交给裁判，避免把整段输出/推理交给裁判。
 
-> 无论 `cot` 开关如何，最终判分都由裁判模型输出的 `verdict` 决定（并写到 `model_correct`）。
+> `--cot` 参数目前仅为兼容历史命令行保留；最终判分仍由裁判模型输出的 `verdict` 决定（并写到 `model_correct`）。
 
-### 2) 并发与重试（稳定性/速度）
+### 2) `--answer-json-max-attempts`（答题 JSON 解析失败重试次数）
+- **作用**：当答题模型输出无法解析为 JSON 时，脚本会对同一题进行“内容级重试”（重新询问答题模型要求严格 JSON）。
+- **默认**：3
+- **YAML**：`answer_json_max_attempts: 3`
+
+### 3) 并发与重试（稳定性/速度）
 - **`--model-concurrency`**：被测模型并发（推荐显式设置）
 - **`--judge-concurrency`**：裁判模型并发（推荐显式设置）
 - **`--concurrency`**：legacy 参数；当你未显式设置 `--model-concurrency/--judge-concurrency` 时，会作为二者的默认值（默认 8）
@@ -112,15 +113,15 @@ python eval_questions.py \
 - **`--retry-base-delay-s`**：指数退避基准延迟（默认 1.0）
 - **`--retry-max-delay-s`**：最大退避延迟（默认 16.0）
 
-### 3) 抽样/限量：`--limit`
+### 4) 抽样/限量：`--limit`
 - 只评测前 N 行，便于快速冒烟测试。
 
-### 4) 网络代理（VPN/Proxy）
+### 5) 网络代理（VPN/Proxy）
 - **`--vpn off`（默认）**：直连，并且忽略环境代理变量（`trust_env=False`）。
 - **`--vpn on`**：启用代理；若不填 `--proxy`，默认使用 `http://127.0.0.1:7897`。
 - **`--proxy`**：例如 `http://127.0.0.1:7897` 或 `socks5://127.0.0.1:7897`
 
-### 5) Token/温度/超时（Model/Judge 都可配）
+### 6) Token/温度/超时（Model/Judge 都可配）
 - `--model-max-tokens` / `--judge-max-tokens`
 - `--model-temperature` / `--judge-temperature`
 - `--model-timeout-s` / `--judge-timeout-s`
@@ -147,6 +148,7 @@ retry_max_delay_s: 16.0
 limit:
 
 cot: off
+answer_json_max_attempts: 3
 vpn: off
 proxy: ""
 
