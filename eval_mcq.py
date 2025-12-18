@@ -810,7 +810,7 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     model_name_safe = re.sub(r'[<>:"/\\|?*]', '_', model_cfg.model)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     results_path = os.path.join(run_cfg.out_dir, f"results_{timestamp}_{model_name_safe}.jsonl")  # Same file for all logs
-    summary_path = os.path.join(run_cfg.out_dir, "summary.json")
+    summary_path = os.path.join(run_cfg.out_dir, f"summary_{timestamp}.json")
 
     if os.path.exists(results_path):
         os.remove(results_path)
@@ -839,10 +839,15 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
 
     # Add a column for model correctness
     # 计算每题最终是否正确：选择题用 rule_correct，填空题用 judge_correct
-    overall_total = 0  # 分母：总题数（不含 skipped）
-    overall_correct = 0  # 分子：最终判对题数
-    overall_judged = 0  # 有明确 True/False 的题数（可用于额外统计）
-    overall_correct_judged = 0  # 在 judged 范围内判对的题数
+    # ============= NEW METRICS (replace old accuracy metrics) =============
+    overall_total = 0
+    overall_correct = 0
+
+    mc_total = 0
+    mc_correct = 0
+
+    non_mc_total = 0
+    non_mc_correct = 0
 
     for result, row in zip(results, rows):
         if result.get("skipped"):
@@ -850,25 +855,36 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
             continue
 
         qtype = str(row.get("Question_Type", "")).strip()
-        if qtype == "Multiple Choice":
-            final_correct = result.get("rule_correct")  # True/False
-        else:
-            final_correct = result.get("judge_correct")  # True/False/None(解析失败等)
 
-        # 写回到表格：None 也保留（方便你排查 judge 为啥没出 JSON）
-        row["model_correct"] = final_correct
+        if qtype == "Multiple Choice":
+            final_correct = (result.get("rule_correct") is True)
+            mc_total += 1
+            if final_correct:
+                mc_correct += 1
+            # 写回表格：选择题用 rule_correct（True/False）
+            row["model_correct"] = result.get("rule_correct")
+
+        else:
+            # 非选择题：只把 judge_correct == True 视为正确
+            final_correct = (result.get("judge_correct") is True)
+            non_mc_total += 1
+            if final_correct:
+                non_mc_correct += 1
+            # 写回表格：保留 judge_correct（True/False/None）方便排查
+            row["model_correct"] = result.get("judge_correct")
 
         overall_total += 1
-        if final_correct is True:
+        if final_correct:
             overall_correct += 1
 
-        if final_correct in (True, False):
-            overall_judged += 1
-            if final_correct is True:
-                overall_correct_judged += 1
+    def _fmt_score(correct: int, total: int) -> str:
+        pct = (correct / total * 100.0) if total else 0.0
+        return f"{correct}/{total} ({pct:.2f}%)"
 
-    overall_accuracy = (overall_correct / overall_total) if overall_total else 0.0
-    overall_accuracy_judged_only = (overall_correct_judged / overall_judged) if overall_judged else None
+    overall_score_str = _fmt_score(overall_correct, overall_total)
+    mc_score_str = _fmt_score(mc_correct, mc_total)
+    non_mc_score_str = _fmt_score(non_mc_correct, non_mc_total)
+    # =====================================================================
 
     # Save results to a new Excel file
     output_df = pd.DataFrame(rows)
@@ -892,29 +908,29 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     latencies = [r.get("latency_ms", 0) for r in results if not r.get("skipped")]
     avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
 
-    valid_rule = [
-        r for r in results
-        if (not r.get("skipped")) and (r.get("gold") or "") and (r.get("pred") or "")
-    ]
-    rule_acc = sum(1 for r in valid_rule if r.get("rule_correct")) / len(valid_rule) if valid_rule else 0.0
-
-    judge_acc = None
-    if judge_provider:
-        valid_judge = [r for r in results if (not r.get("skipped")) and (r.get("judge_correct") in [True, False])]
-        judge_acc = sum(1 for r in valid_judge if r.get("judge_correct") is True) / len(
-            valid_judge) if valid_judge else 0.0
-
     summary = {
         "total": total,
         "skipped": skipped,
         "failed_calls": failed,
         "avg_latency_ms": avg_latency,
-        "rule_accuracy": rule_acc,
-        "judge_accuracy": judge_acc,
-        "overall_accuracy": overall_accuracy,
-        "overall_correct": overall_correct,
-        "overall_total_evaluated": overall_total,  # = total - skipped
-        "overall_accuracy_judged_only": overall_accuracy_judged_only,  # 方便看 judge 是否大量 None
+
+        # NEW required metrics:
+        "overall": {
+            "correct": overall_correct,
+            "total": overall_total,
+            "score": overall_score_str,
+        },
+        "multiple_choice": {
+            "correct": mc_correct,
+            "total": mc_total,
+            "score": mc_score_str,
+        },
+        "non_multiple_choice": {
+            "correct": non_mc_correct,
+            "total": non_mc_total,
+            "score": non_mc_score_str,
+        },
+
         "timestamp_ms": now_ms(),
         "vpn": run_cfg.vpn,
         "proxy": run_cfg.proxy if run_cfg.vpn == "on" else "",
@@ -935,9 +951,14 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+
+    print("\n=== Scores ===", flush=True)
+    print(f"Overall: {overall_score_str}", flush=True)
+    print(f"Multiple Choice: {mc_score_str}", flush=True)
+    print(f"Non-Multiple Choice: {non_mc_score_str}", flush=True)
+
     print(f"\nSaved full archives to: {results_path}", flush=True)
     print(f"Saved summary to: {summary_path}", flush=True)
-
 
 
 # ----------------------------
