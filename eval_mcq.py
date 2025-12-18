@@ -158,6 +158,114 @@ def extract_answer_from_text(text: str, cot_on: bool) -> Optional[str]:
     return norm if norm else None
 
 
+def _sanitize_call_for_logging(provider: str, call_obj: Optional[Dict[str, Any]], image_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    """
+    Remove large base64 image payloads from request logs.
+    Replace them with a compact reference (image_path) so jsonl stays readable.
+    """
+    if not call_obj:
+        return call_obj
+
+    # shallow copy top-level dict
+    out = dict(call_obj)
+    req = out.get("request")
+    if not isinstance(req, dict):
+        return out
+
+    p = (provider or "").lower()
+    req2 = dict(req)
+
+    try:
+        if p == "openai":
+            # messages: [{role, content}, ...]
+            messages = req2.get("messages")
+            if isinstance(messages, list):
+                new_messages = []
+                for msg in messages:
+                    if not isinstance(msg, dict):
+                        new_messages.append(msg)
+                        continue
+                    msg2 = dict(msg)
+                    content = msg2.get("content")
+                    # user content can be list of blocks
+                    if isinstance(content, list):
+                        new_blocks = []
+                        for blk in content:
+                            if isinstance(blk, dict) and blk.get("type") == "image_url":
+                                blk2 = dict(blk)
+                                img = blk2.get("image_url")
+                                if isinstance(img, dict):
+                                    img2 = dict(img)
+                                    img2["url"] = image_path or "<image_omitted>"
+                                    blk2["image_url"] = img2
+                                new_blocks.append(blk2)
+                            else:
+                                new_blocks.append(blk)
+                        msg2["content"] = new_blocks
+                    new_messages.append(msg2)
+                req2["messages"] = new_messages
+
+        elif p == "gemini":
+            # contents: [{role, parts:[{text}|{inline_data:{mime_type,data}}]}]
+            contents = req2.get("contents")
+            if isinstance(contents, list):
+                new_contents = []
+                for c in contents:
+                    if not isinstance(c, dict):
+                        new_contents.append(c)
+                        continue
+                    c2 = dict(c)
+                    parts = c2.get("parts")
+                    if isinstance(parts, list):
+                        new_parts = []
+                        for pt in parts:
+                            if isinstance(pt, dict) and "inline_data" in pt and isinstance(pt.get("inline_data"), dict):
+                                pt2 = dict(pt)
+                                inline2 = dict(pt2["inline_data"])
+                                inline2["data"] = image_path or "<image_omitted>"
+                                pt2["inline_data"] = inline2
+                                new_parts.append(pt2)
+                            else:
+                                new_parts.append(pt)
+                        c2["parts"] = new_parts
+                    new_contents.append(c2)
+                req2["contents"] = new_contents
+
+        elif p == "claude":
+            # messages: [{role, content:[{type:text}|{type:image, source:{... data:...}}]}]
+            messages = req2.get("messages")
+            if isinstance(messages, list):
+                new_messages = []
+                for msg in messages:
+                    if not isinstance(msg, dict):
+                        new_messages.append(msg)
+                        continue
+                    msg2 = dict(msg)
+                    content = msg2.get("content")
+                    if isinstance(content, list):
+                        new_blocks = []
+                        for blk in content:
+                            if isinstance(blk, dict) and blk.get("type") == "image":
+                                blk2 = dict(blk)
+                                src = blk2.get("source")
+                                if isinstance(src, dict):
+                                    src2 = dict(src)
+                                    src2["data"] = image_path or "<image_omitted>"
+                                    blk2["source"] = src2
+                                new_blocks.append(blk2)
+                            else:
+                                new_blocks.append(blk)
+                        msg2["content"] = new_blocks
+                    new_messages.append(msg2)
+                req2["messages"] = new_messages
+    except Exception:
+        # Best-effort sanitization only; never break logging due to unexpected schema.
+        pass
+
+    out["request"] = req2
+    return out
+
+
 # ----------------------------
 # Config
 # ----------------------------
@@ -454,24 +562,28 @@ def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
         f"Options:\n{opts}\n"
     )
 
-def build_judge_prompt(question: str, options: List[str], model_raw_text: str, gold: str) -> str:
-    opts = "\n".join(options)
-    gold_norm = normalize_csv_letters(gold)
+def build_freeform_judge_prompt(question: str, model_answer: str, gold: str) -> str:
     return (
-        "You are an impartial evaluator (judge) for a multiple-choice question. Some questions may have multiple correct options.\n"
-        "Decide whether the model's answer should be counted as correct.\n"
-        "Gold is provided.\n\n"
-        "Return ONLY valid JSON with schema:\n"
-        '{\n'
-        '  "verdict": "correct" | "incorrect" | "unjudgeable",  # The final verdict of the model\'s answer.\n'
-        '  "extracted_answer": string|null,  # The model\'s extracted answer, null if not extractable.\n'
-        '  "reason": string  # A brief reason for the verdict.\n'
-        '}\n\n'
+        "You are a strict evaluator. Decide whether the model answer should be counted as correct.\n"
+        "Return ONLY a JSON object. No markdown, no extra text.\n"
+        "The JSON schema is:\n"
+        "{\n"
+        '  "verdict": "correct" | "incorrect" | "unjudgeable",\n'
+        '  "extracted_answer": string|null,\n'
+        '  "reason": string\n'
+        "}\n"
+        "Example:\n"
+        '{ "verdict": "correct", "extracted_answer": "3", "reason": "Matches the gold answer." }\n\n'
         f"Question:\n{question}\n\n"
-        f"Options:\n{opts}\n\n"
-        f"Gold (normalized):\n{gold_norm}\n\n"
-        f"Model response:\n{model_raw_text}\n"
+        f"Gold Answer:\n{gold}\n\n"
+        f"Model Answer:\n{model_answer}\n"
     )
+
+
+
+
+
+
 
 
 def parse_judge_json(text: str) -> Dict[str, Any]:
@@ -512,6 +624,7 @@ async def eval_one(
         judge_provider: Optional[LLMProvider],
         run_cfg: RunConfig,
         sem: asyncio.Semaphore,
+        write_lock: asyncio.Lock,
         results_path: str,
 ) -> Dict[str, Any]:
     qid = str(row.get("id", "")).strip()
@@ -559,7 +672,8 @@ async def eval_one(
             "model_call": None,
             "judge_call": None,
         }
-        safe_jsonl_append(results_path, out)
+        async with write_lock:
+            safe_jsonl_append(results_path, out)
         print(f"[{idx}/{total}] id={qid}  SKIP(image missing)  gold={gold_norm}  image={img_rel}", flush=True)
         return out
 
@@ -582,6 +696,7 @@ async def eval_one(
         t1 = now_ms()
 
     model_text = extract_text_from_provider_response(model_provider.cfg.provider, model_call.get("response"))
+    model_call_log = _sanitize_call_for_logging(model_provider.cfg.provider, model_call, image_path)
 
     # 选择题与填空题的处理逻辑不同
     if question_type == "Multiple Choice":
@@ -613,18 +728,19 @@ async def eval_one(
     judge_call = None
     judge_block = None
     judge_correct = None
+    judge_call_log = None
 
     # 仅针对填空题使用裁判模型
     if judge_provider is not None and question_type != "Multiple Choice":
         # 裁判模型逻辑
-        judge_prompt = f"Evaluate if the model's answer to the question is correct:\nQuestion:\n{question}\nModel's Answer:\n{model_text}\nGold Answer:\n{gold_raw}"
-
+        judge_prompt = build_freeform_judge_prompt(question, model_text, gold_raw)
         async with sem:
             jt0 = now_ms()
             judge_call = await judge_provider.call(prompt=judge_prompt, image_data_url=image_data_url)
             jt1 = now_ms()
 
         judge_text = extract_text_from_provider_response(judge_provider.cfg.provider, judge_call.get("response"))
+        judge_call_log = _sanitize_call_for_logging(judge_provider.cfg.provider, judge_call, image_path)
         judge_json = parse_judge_json(judge_text)
         verdict = str(judge_json.get("verdict", "unjudgeable")).lower()
 
@@ -667,20 +783,19 @@ async def eval_one(
         "question": question,
         "options": options,
         "image_path": image_path,
-        "image_data_url": "image",  # Use "image" as placeholder
+        # Keep a compact image reference; do NOT log base64.
+        "image_data_url": image_path if image_path else None,
         "cot": run_cfg.cot,
         # FULL ARCHIVE:
-        "model_call": model_call,
+        "model_call": model_call_log,
         "model_text": model_text,
         "judge": judge_block,
-        "judge_call": judge_call,
+        "judge_call": judge_call_log,
     }
 
-    # 使用时间戳+模型名称作为文件名
-    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    model_name = model_provider.cfg.model.replace(":", "_")
-    results_path = os.path.join(run_cfg.out_dir, f"results_{timestamp}_{model_name}.jsonl")  # All logs in one file
-    safe_jsonl_append(results_path, out)
+    # IMPORTANT: Always append to the single shared results_path computed in run_eval().
+    async with write_lock:
+        safe_jsonl_append(results_path, out)
     return out
 
 
@@ -688,13 +803,13 @@ async def eval_one(
 
 
 async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optional[ProviderConfig],
-                   run_cfg: RunConfig) -> None:
+             run_cfg: RunConfig) -> None:
     ensure_dir(run_cfg.out_dir)
 
-    # Ensure all logs are written to the same file
+    # 确保文件名中的非法字符被替换
+    model_name_safe = re.sub(r'[<>:"/\\|?*]', '_', model_cfg.model)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    model_name = model_cfg.model.replace(":", "_")
-    results_path = os.path.join(run_cfg.out_dir, f"results_{timestamp}_{model_name}.jsonl")  # Same file for all logs
+    results_path = os.path.join(run_cfg.out_dir, f"results_{timestamp}_{model_name_safe}.jsonl")  # Same file for all logs
     summary_path = os.path.join(run_cfg.out_dir, "summary.json")
 
     if os.path.exists(results_path):
@@ -704,6 +819,7 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     judge_provider = LLMProvider(judge_cfg, run_cfg) if judge_cfg else None
 
     sem = asyncio.Semaphore(run_cfg.concurrency)
+    write_lock = asyncio.Lock()
 
     rows = df.to_dict(orient="records")
     if run_cfg.limit is not None:
@@ -716,18 +832,47 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     )
 
     tasks = [
-        eval_one(r, i + 1, total_questions, model_provider, judge_provider, run_cfg, sem, results_path)
+        eval_one(r, i + 1, total_questions, model_provider, judge_provider, run_cfg, sem, write_lock, results_path)
         for i, r in enumerate(rows)
     ]
     results = await asyncio.gather(*tasks)
 
     # Add a column for model correctness
+    # 计算每题最终是否正确：选择题用 rule_correct，填空题用 judge_correct
+    overall_total = 0  # 分母：总题数（不含 skipped）
+    overall_correct = 0  # 分子：最终判对题数
+    overall_judged = 0  # 有明确 True/False 的题数（可用于额外统计）
+    overall_correct_judged = 0  # 在 judged 范围内判对的题数
+
     for result, row in zip(results, rows):
-        row["model_correct"] = result.get("rule_correct") or result.get("judge_correct")
+        if result.get("skipped"):
+            row["model_correct"] = None
+            continue
+
+        qtype = str(row.get("Question_Type", "")).strip()
+        if qtype == "Multiple Choice":
+            final_correct = result.get("rule_correct")  # True/False
+        else:
+            final_correct = result.get("judge_correct")  # True/False/None(解析失败等)
+
+        # 写回到表格：None 也保留（方便你排查 judge 为啥没出 JSON）
+        row["model_correct"] = final_correct
+
+        overall_total += 1
+        if final_correct is True:
+            overall_correct += 1
+
+        if final_correct in (True, False):
+            overall_judged += 1
+            if final_correct is True:
+                overall_correct_judged += 1
+
+    overall_accuracy = (overall_correct / overall_total) if overall_total else 0.0
+    overall_accuracy_judged_only = (overall_correct_judged / overall_judged) if overall_judged else None
 
     # Save results to a new Excel file
     output_df = pd.DataFrame(rows)
-    output_df.to_excel(os.path.join(run_cfg.out_dir, f"evaluated_{timestamp}_{model_name}.xlsx"), index=False)
+    output_df.to_excel(os.path.join(run_cfg.out_dir, f"evaluated_{timestamp}_{model_name_safe}.xlsx"), index=False)
 
     total = len(results)
     skipped = sum(1 for r in results if r.get("skipped"))
@@ -766,6 +911,10 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
         "avg_latency_ms": avg_latency,
         "rule_accuracy": rule_acc,
         "judge_accuracy": judge_acc,
+        "overall_accuracy": overall_accuracy,
+        "overall_correct": overall_correct,
+        "overall_total_evaluated": overall_total,  # = total - skipped
+        "overall_accuracy_judged_only": overall_accuracy_judged_only,  # 方便看 judge 是否大量 None
         "timestamp_ms": now_ms(),
         "vpn": run_cfg.vpn,
         "proxy": run_cfg.proxy if run_cfg.vpn == "on" else "",
@@ -788,7 +937,6 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     print(f"\nSaved full archives to: {results_path}", flush=True)
     print(f"Saved summary to: {summary_path}", flush=True)
-
 
 
 
