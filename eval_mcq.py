@@ -587,6 +587,7 @@ def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
 def build_freeform_judge_prompt(question: str, model_answer: str, gold: str) -> str:
     return (
         "You are a strict evaluator. Decide whether the model answer should be counted as correct.\n"
+        "First, extract the final answer/result from the model answer (keep it short). Do NOT include any chain-of-thought.\n"
         "Return ONLY a JSON object. No markdown, no extra text.\n"
         "The JSON schema is:\n"
         "{\n"
@@ -746,12 +747,6 @@ async def eval_one(
     else:
         prompt = f"Answer the following question:\n\n{question}\n\nProvide a complete and accurate answer:"
 
-    # Real-time: start
-    print(
-        f"[{idx}/{total}] id={qid}  START  gold={gold_norm}  img_dep={img_dep}  img={'yes' if bool(image_data_url) else 'no'}  cot={run_cfg.cot}  mcq={mcq}",
-        flush=True
-    )
-
     async with sem:
         t0 = now_ms()
         model_call = await model_provider.call(prompt=prompt, image_data_url=image_data_url)
@@ -760,27 +755,10 @@ async def eval_one(
     model_text = extract_text_from_provider_response(model_provider.cfg.provider, model_call.get("response"))
     model_call_log = _sanitize_call_for_logging(model_provider.cfg.provider, model_call, image_path)
 
-    # We keep an extracted prediction for logging/debugging only.
-    # IMPORTANT: scoring is ALWAYS performed by the judge model (no local matching logic).
-    if mcq:
-        pred_norm = extract_answer_from_text(model_text, cot_on=cot_on)  # may be None in COT mode if format violated
-    else:
-        pred_norm = model_text.strip()
+    # We do not rely on local extraction for scoring anymore.
+    # Keep a best-effort extracted value for debugging only (may be None).
+    pred_extracted_debug = extract_answer_from_text(model_text, cot_on=cot_on) if mcq else None
     rule_correct = None
-
-    pred_raw = pred_norm  # keep compatible field meaning
-
-    ok = "N/A"
-
-    preview = (model_text or "").replace("\n", " ").strip()
-    if len(preview) > 200:
-        preview = preview[:200] + "..."
-
-    print(
-        f"[{idx}/{total}] id={qid}  DONE  gold={gold_norm}  pred={pred_norm if pred_norm else None}  {ok}  {t1 - t0}ms",
-        flush=True
-    )
-    print(f"   model_text: {preview}", flush=True)
     judge_call = None
     judge_block = None
     judge_correct = None
@@ -820,11 +798,17 @@ async def eval_one(
             "judge_latency_ms": jt1 - jt0,
         }
 
-        jpreview = (judge_text or "").replace("\n", " ").strip()
-        if len(jpreview) > 200:
-            jpreview = jpreview[:200] + "..."
-        print(f"   judge_correct={judge_correct}  judge_latency={jt1 - jt0}ms", flush=True)
-        print(f"   judge_text: {jpreview}", flush=True)
+    # Prefer judge-extracted answer as the prediction shown in logs/Excel.
+    judge_extracted_for_pred: Optional[str] = None
+    if isinstance(judge_block, dict):
+        jj = judge_block.get("judge_json") or {}
+        if isinstance(jj, dict):
+            if mcq:
+                v = jj.get("extracted_answer_normalized")
+                judge_extracted_for_pred = v if isinstance(v, str) and v else None
+            else:
+                v = jj.get("extracted_answer")
+                judge_extracted_for_pred = v if isinstance(v, str) and v.strip() else None
 
     out = {
         "id": qid,
@@ -834,11 +818,16 @@ async def eval_one(
         "skip_reason": None,
         "gold_raw": gold_raw,
         "gold": gold_norm,
-        "pred_raw": pred_raw,
-        "pred": pred_norm if pred_norm else None,
+        # Use judge-extracted answer as the canonical prediction.
+        "pred_raw": judge_extracted_for_pred,
+        "pred": judge_extracted_for_pred,
+        # Keep debug extraction from model output for troubleshooting (not used for scoring).
+        "pred_extracted_debug": pred_extracted_debug,
         "rule_correct": rule_correct,
         "judge_correct": judge_correct,
         "latency_ms": t1 - t0,
+        "judge_latency_ms": (judge_block.get("judge_latency_ms") if isinstance(judge_block, dict) else None),
+        "total_latency_ms": (t1 - t0) + (judge_block.get("judge_latency_ms") if isinstance(judge_block, dict) and isinstance(judge_block.get("judge_latency_ms"), int) else 0),
         "question": question,
         "options": options,
         "question_type_raw": question_type_raw,
@@ -857,6 +846,23 @@ async def eval_one(
     # IMPORTANT: Always append to the single shared results_path computed in run_eval().
     async with write_lock:
         safe_jsonl_append(results_path, out)
+
+    # Print ONLY after both model + judge have completed for this question.
+    # (Per user request: do not print immediately after model finishes.)
+    model_preview = (model_text or "").replace("\n", " ").strip()
+    if len(model_preview) > 200:
+        model_preview = model_preview[:200] + "..."
+    jtxt = (judge_block.get("judge_text") if isinstance(judge_block, dict) else "") or ""
+    judge_preview = jtxt.replace("\n", " ").strip()
+    if len(judge_preview) > 200:
+        judge_preview = judge_preview[:200] + "..."
+
+    print(
+        f"[{idx}/{total}] id={qid}  DONE  mcq={mcq}  gold={gold_norm}  pred={judge_extracted_for_pred}  judge_correct={judge_correct}  model_ms={t1 - t0}  judge_ms={(out.get('judge_latency_ms') or 0)}  total_ms={out.get('total_latency_ms')}",
+        flush=True
+    )
+    print(f"   model_text: {model_preview}", flush=True)
+    print(f"   judge_text: {judge_preview}", flush=True)
     return out
 
 
