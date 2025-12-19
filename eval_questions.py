@@ -1051,33 +1051,117 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
 
     # Final correctness is ALWAYS determined by judge_correct for ALL question types.
     # ============= METRICS (judge-only) =============
-    overall_total = 0
-    overall_correct = 0
-    judged_total = 0
-    judged_correct = 0
+    def _is_nan(x: Any) -> bool:
+        try:
+            return isinstance(x, float) and pd.isna(x)
+        except Exception:
+            return False
 
+    def _norm_group_value(v: Any) -> str:
+        if v is None or _is_nan(v):
+            return "<missing>"
+        s = str(v).strip()
+        return s if s else "<missing>"
+
+    def _acc(correct: int, denom: int) -> float:
+        return (correct / denom) if denom else 0.0
+
+    def _fmt_pct(x: float) -> str:
+        return f"{x * 100.0:.2f}%"
+
+    def _group_breakdown(rows_in: List[Dict[str, Any]], key: str) -> Dict[str, Any]:
+        """
+        Group-by breakdown over *non-skipped* rows.
+        model_correct: True/False/None (None = unjudgeable)
+        """
+        buckets: Dict[str, Dict[str, int]] = {}
+        for r in rows_in:
+            if r.get("skipped"):
+                continue
+            g = _norm_group_value(r.get(key))
+            b = buckets.setdefault(g, {"total": 0, "correct": 0, "incorrect": 0, "unjudgeable": 0})
+            b["total"] += 1
+            mc = r.get("model_correct")
+            if mc is True:
+                b["correct"] += 1
+            elif mc is False:
+                b["incorrect"] += 1
+            else:
+                b["unjudgeable"] += 1
+
+        out: Dict[str, Any] = {}
+        for g, b in buckets.items():
+            judged = b["correct"] + b["incorrect"]
+            out[g] = {
+                **b,
+                "judged": judged,
+                "accuracy_judged": _acc(b["correct"], judged),
+                "accuracy_judged_str": _fmt_pct(_acc(b["correct"], judged)),
+                "accuracy_all": _acc(b["correct"], b["total"]),
+                "accuracy_all_str": _fmt_pct(_acc(b["correct"], b["total"])),
+            }
+        return out
+
+    # Enrich rows with evaluation fields for downstream grouping / Excel output
     for result, row in zip(results, rows):
-        if result.get("skipped"):
+        row["skipped"] = bool(result.get("skipped"))
+        row["skip_reason"] = result.get("skip_reason")
+        row["question_type_inferred"] = result.get("question_type_inferred")
+        row["answer_json_ok"] = result.get("answer_json_ok")
+        row["answer_json_attempts"] = result.get("answer_json_attempts")
+        row["answer_json_error"] = result.get("answer_json_error")
+        row["pred"] = result.get("pred")
+
+        if row["skipped"]:
             row["model_correct"] = None
             continue
 
-        final_correct = (result.get("judge_correct") is True)
-        judged_total += 1
-        if final_correct:
-            judged_correct += 1
         # 写回表格：统一用 judge_correct（True/False/None）
         row["model_correct"] = result.get("judge_correct")
 
-        overall_total += 1
-        if final_correct:
-            overall_correct += 1
+    overall_total = sum(1 for r in rows if not r.get("skipped"))
+    overall_correct = sum(1 for r in rows if (not r.get("skipped")) and r.get("model_correct") is True)
+    overall_incorrect = sum(1 for r in rows if (not r.get("skipped")) and r.get("model_correct") is False)
+    overall_unjudgeable = sum(1 for r in rows if (not r.get("skipped")) and r.get("model_correct") is None)
+    overall_judged = overall_correct + overall_incorrect
 
-    def _fmt_score(correct: int, total: int) -> str:
-        pct = (correct / total * 100.0) if total else 0.0
-        return f"{correct}/{total} ({pct:.2f}%)"
+    overall = {
+        "correct": overall_correct,
+        "incorrect": overall_incorrect,
+        "unjudgeable": overall_unjudgeable,
+        "total": overall_total,
+        "judged": overall_judged,
+        "accuracy_judged": _acc(overall_correct, overall_judged),
+        "accuracy_judged_str": _fmt_pct(_acc(overall_correct, overall_judged)),
+        "accuracy_all": _acc(overall_correct, overall_total),
+        "accuracy_all_str": _fmt_pct(_acc(overall_correct, overall_total)),
+    }
 
-    overall_score_str = _fmt_score(overall_correct, overall_total)
-    judged_score_str = _fmt_score(judged_correct, judged_total)
+    # Breakdowns (only if the corresponding column exists in the dataset)
+    cols = set(df.columns)
+    breakdowns: Dict[str, Any] = {
+        "by_question_type_inferred": _group_breakdown(rows, "question_type_inferred"),
+    }
+    if "Question_Type" in cols:
+        breakdowns["by_question_type_raw"] = _group_breakdown(rows, "Question_Type")
+    if "Image_Dependency" in cols:
+        breakdowns["by_image_dependency"] = _group_breakdown(rows, "Image_Dependency")
+
+    # Best-effort: field/domain and difficulty columns may vary by dataset.
+    # We pick the first matching column name in a common candidate list.
+    def _pick_col(candidates: List[str]) -> Optional[str]:
+        for c in candidates:
+            if c in cols:
+                return c
+        return None
+
+    field_col = _pick_col(["Field", "Domain", "Subject", "领域", "学科", "科目"])
+    if field_col:
+        breakdowns["by_field"] = {"column": field_col, "groups": _group_breakdown(rows, field_col)}
+
+    difficulty_col = _pick_col(["Difficulty", "难度", "Level", "Difficult"])
+    if difficulty_col:
+        breakdowns["by_difficulty"] = {"column": difficulty_col, "groups": _group_breakdown(rows, difficulty_col)}
     # =====================================================================
 
     # Save results to a new Excel file
@@ -1108,17 +1192,15 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
         "failed_calls": failed,
         "avg_latency_ms": avg_latency,
 
-        # NEW required metrics:
-        "overall": {
-            "correct": overall_correct,
-            "total": overall_total,
-            "score": overall_score_str,
-        },
+        # judge-only metrics (single source of truth)
+        "overall": overall,
+        "breakdowns": breakdowns,
 
         "timestamp_ms": now_ms(),
         "vpn": run_cfg.vpn,
         "proxy": run_cfg.proxy if run_cfg.vpn == "on" else "",
         "cot": run_cfg.cot,
+        "answer_json_max_attempts": run_cfg.answer_json_max_attempts,
         "model": {
             "provider": model_cfg.provider,
             "base_url": model_cfg.base_url,
@@ -1137,8 +1219,8 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 
     print("\n=== Scores ===", flush=True)
-    print(f"Overall: {overall_score_str}", flush=True)
-    print(f"Judged (all questions): {judged_score_str}", flush=True)
+    print(f"Overall (accuracy_judged): {overall.get('accuracy_judged_str')}", flush=True)
+    print(f"Overall (accuracy_all): {overall.get('accuracy_all_str')}", flush=True)
 
     print(f"\nSaved full archives to: {results_path}", flush=True)
     print(f"Saved summary to: {summary_path}", flush=True)
@@ -1213,9 +1295,12 @@ def main():
     ap.add_argument("--model-temperature", type=float, default=None)
     ap.add_argument("--model-max-tokens", type=int, default=None)
 
-    # judge
-    ap.add_argument("--judge-enable", action="store_true",
-                    help="(legacy) Kept for backward compatibility; scoring always uses judge now.")
+    # judge (deprecated flag)
+    ap.add_argument(
+        "--judge-enable",
+        action="store_true",
+        help="DEPRECATED (no-op). Scoring always uses the judge model.",
+    )
     ap.add_argument("--judge-provider", type=str, default="")
     ap.add_argument("--judge-base-url", type=str, default="")
     ap.add_argument("--judge-api-key", type=str, default="")

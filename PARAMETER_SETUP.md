@@ -46,7 +46,7 @@ python eval_questions.py \
 ### 3) 裁判模型（Judge）开关与配置（非选择题必读）
 - **裁判模型会用于所有题型**（包括选择题），用于给出最终 `judge_correct`（True/False/None）。
 - 你可以显式指定裁判模型参数；如果不指定，则会默认“尽量复用 model 配置”（provider/base_url/model），同时裁判 key 会优先使用 `--judge-api-key` / `judge.api_key`，否则回退到 model key。
-- **`--judge-enable` 是 legacy 参数**：保留兼容，但不影响当前逻辑（当前逻辑会一直使用裁判模型）。
+- **`--judge-enable` 已废弃**：保留兼容但不影响当前逻辑（当前逻辑会一直使用裁判模型）。
 
 裁判相关参数（与 model 类似）：
 - **`--judge-provider`**、**`--judge-base-url`**、**`--judge-name`**、**`--judge-api-key`**
@@ -184,4 +184,5 @@ python eval_questions.py --config config.yaml
 在 `--out-dir` 下会生成：
 - `results_*.jsonl`：逐题完整日志（包含 model/judge 调用的脱敏请求结构与响应摘要）
 - `summary_*.json`：整体统计（包含 overall 分数、网络/配置摘要等）
+- `summary_*.json` 还会包含 `breakdowns`：按题型/难度/领域/Image_Dependency（若数据列存在）分组的正确率统计
 - `evaluated_*.xlsx`：把逐题 `model_correct` 写回到 Excel
