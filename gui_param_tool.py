@@ -760,13 +760,22 @@ class ParamToolApp:
 
         def runner() -> None:
             try:
+                # Force UTF-8 for stdout decoding on Windows to avoid GBK UnicodeDecodeError.
+                # - encoding/errors affect how *this* process decodes stdout.
+                # - PYTHONIOENCODING/PYTHONUTF8 influence how the child process encodes stdout.
+                child_env = os.environ.copy()
+                child_env.setdefault("PYTHONIOENCODING", "utf-8")
+                child_env.setdefault("PYTHONUTF8", "1")
                 self._proc = subprocess.Popen(
                     full,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     cwd=os.path.dirname(EVAL_SCRIPT),
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     bufsize=1,
+                    env=child_env,
                 )
                 assert self._proc.stdout is not None
                 for line in self._proc.stdout:
