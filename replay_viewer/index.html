@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>LLM QA Playback Viewer</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <meta name="color-scheme" content="light dark" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="header-left">
+        <div class="title">LLM QA Playback Viewer</div>
+        <div class="subtitle">Import <code>results_*.jsonl</code> and review question-by-question.</div>
+      </div>
+      <div class="header-right no-print">
+        <button id="btnPrint" class="btn">Export PDF (Print)</button>
+      </div>
+    </header>
+
+    <main class="app">
+      <section class="panel no-print" aria-label="Controls">
+        <div class="row">
+          <label class="file">
+            <span class="label">Results JSONL</span>
+            <input id="fileJsonl" type="file" accept=".jsonl,.txt,application/json,text/plain" />
+          </label>
+
+          <div class="kv">
+            <div class="label">Loaded</div>
+            <div class="value"><span id="loadedCount">0</span> records</div>
+          </div>
+
+          <div class="kv">
+            <div class="label">Run</div>
+            <div class="value"><span id="runLabel">—</span></div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="nav">
+            <button id="btnPrev" class="btn" title="Previous (hold to fast-skip)">◀ Prev</button>
+            <button id="btnNext" class="btn" title="Next (hold to fast-skip)">Next ▶</button>
+          </div>
+
+          <div class="jump">
+            <label>
+              <span class="label">Jump to ID</span>
+              <input id="jumpId" type="text" placeholder="e.g., 1234" />
+            </label>
+            <button id="btnJump" class="btn">Go</button>
+          </div>
+
+          <div class="jump">
+            <label>
+              <span class="label">Jump to #</span>
+              <input id="jumpIdx" type="number" min="1" step="1" placeholder="e.g., 25" />
+            </label>
+            <button id="btnJumpIdx" class="btn">Go</button>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="kv wide">
+            <div class="label">Image folder (relative)</div>
+            <div class="value">
+              <input id="imageBase" class="text" type="text" value="images" />
+              <div class="hint">Viewer tries <code>&lt;base&gt;/&lt;id&gt;.(png|jpg|jpeg|webp|gif)</code>.</div>
+            </div>
+          </div>
+
+          <div class="kv wide">
+            <div class="label">Card colors</div>
+            <div class="value colors">
+              <label>Question <input id="colorQuestion" type="color" value="#1f6feb" /></label>
+              <label>LLM Response <input id="colorLLM" type="color" value="#2ea043" /></label>
+              <label>Expert <input id="colorExpert" type="color" value="#a371f7" /></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="kv wide">
+            <div class="label">Annotations</div>
+            <div class="value">
+              <button id="btnExportAnn" class="btn">Export annotations.json</button>
+              <label class="file inline">
+                <span class="btn">Import annotations.json</span>
+                <input id="fileAnn" type="file" accept=".json,application/json" />
+              </label>
+              <button id="btnClearAnn" class="btn btn-quiet">Clear local edits</button>
+              <div class="hint">Edits are stored in your browser until you export.</div>
+            </div>
+          </div>
+
+          <div class="kv wide">
+            <div class="label">Math fix (optional)</div>
+            <div class="value">
+              <button id="btnFixMath" class="btn">Fix MathJax Errors (LLM)</button>
+              <button id="btnUndoFix" class="btn btn-quiet">Undo last fix</button>
+              <label class="checkbox">
+                <input id="chkUseFixed" type="checkbox" />
+                Use fixed text (if available)
+              </label>
+              <details class="details">
+                <summary>LLM settings</summary>
+                <div class="grid2">
+                  <label>
+                    <span class="label">Mode</span>
+                    <select id="llmMode">
+                      <option value="direct">Direct (browser fetch)</option>
+                      <option value="manual">Manual (copy request, paste reply)</option>
+                    </select>
+                    <div class="hint">
+                      Direct mode may fail due to CORS. Manual mode always works.
+                    </div>
+                  </label>
+                  <label>
+                    <span class="label">Endpoint</span>
+                    <input id="llmEndpoint" class="text" type="text" value="https://api.openai.com/v1/chat/completions" />
+                  </label>
+                  <label>
+                    <span class="label">Model</span>
+                    <input id="llmModel" class="text" type="text" value="gpt-4o-mini" />
+                  </label>
+                  <label>
+                    <span class="label">API Key</span>
+                    <input id="llmApiKey" class="text" type="password" placeholder="sk-..." />
+                    <div class="hint">Stored only in memory (not saved).</div>
+                  </label>
+                </div>
+              </details>
+              <div id="mathStatus" class="hint"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="viewer" aria-label="Playback">
+        <div class="topline">
+          <div class="badge">
+            <span class="mono" id="metaIdx">—</span>
+            <span class="sep">·</span>
+            <span>ID:</span>
+            <span class="mono" id="metaId">—</span>
+          </div>
+          <div class="badge">
+            <span>Model:</span>
+            <span class="mono" id="metaModel">—</span>
+          </div>
+          <div class="badge" id="metaCorrectBadge">—</div>
+        </div>
+
+        <div class="cards">
+          <article class="card" data-card="question">
+            <div class="card-head">
+              <div class="card-title">Question</div>
+              <div class="card-actions no-print">
+                <label class="slider">
+                  <span class="label">Image zoom</span>
+                  <input id="imgZoom" type="range" min="10" max="300" step="5" value="100" />
+                  <span class="mono" id="imgZoomLabel">100%</span>
+                </label>
+              </div>
+            </div>
+            <div class="card-body">
+              <div id="questionMeta" class="meta"></div>
+              <div id="questionText" class="content"></div>
+              <div id="questionOptions" class="content"></div>
+              <div class="image-wrap">
+                <img id="questionImage" alt="Question image" />
+                <div id="imageHint" class="hint"></div>
+              </div>
+              <details class="details no-print">
+                <summary>Edit (for paper)</summary>
+                <textarea id="editQuestion" class="textarea" rows="6" placeholder="Optionally edit/ellipsis the question for paper..."></textarea>
+              </details>
+            </div>
+          </article>
+
+          <article class="card" data-card="llm">
+            <div class="card-head">
+              <div class="card-title">LLM Response</div>
+              <div class="card-actions no-print">
+                <button id="btnCopyLLM" class="btn btn-quiet">Copy</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div id="llmSummary" class="meta"></div>
+              <div id="llmText" class="content"></div>
+              <details class="details">
+                <summary>Judge summary</summary>
+                <div id="judgeSummary" class="meta"></div>
+              </details>
+              <details class="details no-print">
+                <summary>Edit (for paper)</summary>
+                <textarea id="editLLM" class="textarea" rows="10" placeholder="Optionally edit/ellipsis the LLM response for paper..."></textarea>
+              </details>
+            </div>
+          </article>
+
+          <article class="card" data-card="expert">
+            <div class="card-head">
+              <div class="card-title">Expert Commentary</div>
+              <div class="card-actions no-print">
+                <button id="btnSaveExpert" class="btn">Save</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="meta">Write your analysis (used for PDF export). This does not change model correctness.</div>
+              <textarea id="expertText" class="textarea" rows="10" placeholder="Explain why the model is correct/incorrect; note key reasoning; point out failure modes..."></textarea>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="dlgManual" class="dialog no-print">
+      <form method="dialog" class="dialog-body">
+        <div class="dialog-title">Manual Math Fix</div>
+        <div class="hint">
+          If direct calls are blocked (CORS), copy the request below, run it with your API access, then paste the fixed text output.
+        </div>
+        <label>
+          <span class="label">Request (copy)</span>
+          <textarea id="manualRequest" class="textarea mono" rows="10" readonly></textarea>
+        </label>
+        <label>
+          <span class="label">Paste fixed text (model output)</span>
+          <textarea id="manualPaste" class="textarea" rows="10" placeholder="Paste the fixed text here..."></textarea>
+        </label>
+        <div class="dialog-actions">
+          <button value="cancel" class="btn btn-quiet">Cancel</button>
+          <button id="btnApplyManual" value="ok" class="btn">Apply</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="./app.js"></script>
+    <!-- MathJax (online). If this fails to load, viewer still works without math rendering. -->
+    <script>
+      window.MathJax = {
+        tex: { inlineMath: [["$", "$"], ["\\\\(", "\\\\)"]], displayMath: [["$$", "$$"], ["\\\\[", "\\\\]"]] },
+        options: { renderActions: { addMenu: [] } },
+      };
+    </script>
+    <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  </body>
+</html>
+
