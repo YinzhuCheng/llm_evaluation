@@ -734,10 +734,26 @@ def extract_text_from_provider_response(provider: str, resp_json: Any) -> str:
 def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
     opts = "\n".join(options)
 
-    # Always enforce JSON output to reduce judge tokens and prevent CoT leakage.
+    if cot_on:
+        return (
+            "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
+            "You SHOULD output your chain-of-thought reasoning.\n"
+            "Output format rules (STRICT):\n"
+            "- Return ONLY a JSON object. No markdown. No extra text.\n"
+            "- JSON schema:\n"
+            '{ "answer": "A" | "A,B,C", "cot": string }\n'
+            "- 'answer' must contain ONLY letters among A,B,C,D,E.\n"
+            "- If multiple, separate by comma ',' with NO spaces (example: \"A,B,C\").\n"
+            "- 'cot' is your step-by-step reasoning.\n"
+            "Example:\n"
+            '{ "answer": "B", "cot": "..." }\n\n'
+            f"Question:\n{question}\n\n"
+            f"Options:\n{opts}\n"
+        )
+
     return (
         "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
-        "You may think step-by-step internally, but you MUST NOT output chain-of-thought.\n"
+        "Do NOT output chain-of-thought. Provide only the final answer.\n"
         "Output format rules (STRICT):\n"
         "- Return ONLY a JSON object. No markdown. No extra text.\n"
         "- JSON schema:\n"
@@ -752,10 +768,23 @@ def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
 
 
 def build_freeform_answer_prompt(question: str, cot_on: bool) -> str:
-    # Always enforce JSON output to reduce judge tokens and prevent CoT leakage.
+    if cot_on:
+        return (
+            "Answer the following question.\n"
+            "You SHOULD output your chain-of-thought reasoning.\n"
+            "Output format rules (STRICT):\n"
+            "- Return ONLY a JSON object. No markdown. No extra text.\n"
+            "- JSON schema:\n"
+            '{ "answer": string | number | boolean | list[string], "cot": string }\n'
+            "- 'answer' must be the final result.\n"
+            "- For fill-in with multiple blanks, you may output a list of strings.\n"
+            "- 'cot' is your step-by-step reasoning.\n\n"
+            f"Question:\n{question}\n"
+        )
+
     return (
         "Answer the following question.\n"
-        "You may think step-by-step internally, but you MUST NOT output chain-of-thought.\n"
+        "Do NOT output chain-of-thought. Provide only the final answer.\n"
         "Output format rules (STRICT):\n"
         "- Return ONLY a JSON object. No markdown. No extra text.\n"
         "- JSON schema:\n"
@@ -1416,7 +1445,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
         type=str,
         choices=["on", "off"],
         default=None,
-        help="COT mode: on=force JSON output (answer, brief_reason) with NO chain-of-thought; off=answer-only",
+        help="COT mode: on=include chain-of-thought in JSON field 'cot'; off=answer-only (no chain-of-thought).",
     )
 
     ap.add_argument(

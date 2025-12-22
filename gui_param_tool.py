@@ -210,7 +210,7 @@ class ParamToolApp:
     def _default_cfg(self) -> Dict[str, Any]:
         base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(__file__)
         return {
-            "cot": "on",
+            "cot": "off",
             "vpn": "off",
             "proxy": "http://127.0.0.1:7897",
             "concurrency": 1,
@@ -351,7 +351,7 @@ class ParamToolApp:
         pick.grid(row=0, column=2, rowspan=2, padx=(12, 0), sticky=tk.N)
         ttk.Button(pick, text="选择数据集根目录...", command=self.on_pick_root).pack(fill=tk.X)
 
-        self._add_field("cot", "--cot (输出严格JSON；on=更严格，off=同样JSON但不强调)", r, main, kind="combo", values=["on", "off"], width=12); r += 1
+        self._add_field("cot", "--cot (思维链开关：on=输出cot思维链，off=不输出思维链)", r, main, kind="combo", values=["on", "off"], width=12); r += 1
         self._add_field("concurrency", "--concurrency (旧并发参数：未单独设置时同时作用于model/judge)", r, main, width=12); r += 1
         self._add_field("max_retries", "--max-retries (网络/接口失败重试次数，指数退避)", r, main, width=12); r += 1
 
