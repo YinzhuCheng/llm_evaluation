@@ -13,12 +13,18 @@
 
 ## 关键参数（必须/优先配置）
 
-### 1) 数据集输入：`--input`（或 YAML 的 `input_path`）
-- **作用**：指定待评测的 Excel（`.xlsx`）文件。
-- **示例**：`--input data/dataset.xlsx`
+### 1) 数据集输入：`--input` / `--root`（或 YAML 的 `input_path` / `root_path`）
+- **推荐（更省事）**：只给一个“上一级目录” `--root`  
+  - 约定：数据集在 `<root>/dataset.xlsx`，图片在 `<root>/images/`
+- **兼容旧用法**：继续支持 `--input` 指定任意 `.xlsx` 路径
+
+示例：
+- `--root data/待审核数据集`
+- `--input data/dataset.xlsx`
 
 同时可选：
 - **`--sheet`**：指定工作表名称；不填则读取第一个 sheet。
+- **`--images-root`**：图片根目录（可选；如果你使用了 `--root` 且不传它，会自动用 `--root` 作为图片根目录）
 
 ### 2) 被测模型（Model）配置
 这组参数决定“要评测的模型是谁、去哪调用”。
@@ -135,6 +141,10 @@ python eval_questions.py \
 YAML 示例（字段名与代码读取一致）：
 
 ```yaml
+# 方式1（推荐）：只给 root_path（约定 root 下有 dataset.xlsx 与 images/）
+# root_path: data/待审核数据集
+
+# 方式2：显式给 input_path / images_root
 input_path: data/dataset.xlsx
 sheet_name: Sheet1
 images_root: data
@@ -186,3 +196,7 @@ python eval_questions.py --config config.yaml
 - `summary_*.json`：整体统计（包含 overall 分数、网络/配置摘要等）
 - `summary_*.json` 还会包含 `breakdowns`：按题型/难度/领域/Image_Dependency（若数据列存在）分组的正确率统计
 - `evaluated_*.xlsx`：把逐题 `model_correct` 写回到 Excel
+
+**指标口径（重要）**：
+- 只保留**单一准确率**（overall accuracy）
+- **裁判返回 unjudgeable 一律按错误计入**（即不会再单独统计 unjudgeable，也不会再区分 judged/all 两套 accuracy）

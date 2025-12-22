@@ -78,6 +78,7 @@ def _build_arg_list(cfg: Dict[str, Any]) -> List[str]:
 
     # Core
     add("--config", cfg.get("config"))
+    add("--root", cfg.get("root"))
     add("--input", cfg.get("input"))
     add("--sheet", cfg.get("sheet"))
     add("--images-root", cfg.get("images_root"))
@@ -320,13 +321,15 @@ class ParamToolApp:
         main.pack(side=tk.TOP, fill=tk.X)
 
         r = 0
+        self._add_field("root", "--root (上一级目录: dataset.xlsx + images/)", r, main); r += 1
         self._add_field("input", "--input (数据集xlsx)", r, main); r += 1
         self._add_field("images_root", "--images-root (图片根目录)", r, main); r += 1
         self._add_field("out_dir", "--out-dir (输出目录)", r, main); r += 1
 
         # File pickers
         pick = ttk.Frame(main)
-        pick.grid(row=0, column=2, rowspan=3, padx=(12, 0), sticky=tk.N)
+        pick.grid(row=0, column=2, rowspan=4, padx=(12, 0), sticky=tk.N)
+        ttk.Button(pick, text="选择root目录...", command=self.on_pick_root).pack(fill=tk.X)
         ttk.Button(pick, text="选择xlsx...", command=self.on_pick_input).pack(fill=tk.X)
         ttk.Button(pick, text="选择图片目录...", command=self.on_pick_images_root).pack(fill=tk.X, pady=6)
         ttk.Button(pick, text="选择输出目录...", command=self.on_pick_out_dir).pack(fill=tk.X)
@@ -429,6 +432,7 @@ class ParamToolApp:
         # strings
         for k in [
             "config",
+            "root",
             "input",
             "sheet",
             "images_root",
@@ -494,6 +498,11 @@ class ParamToolApp:
             set_v(k, v)
 
     # ---------- Actions ----------
+    def on_pick_root(self) -> None:
+        p = filedialog.askdirectory(title="选择 root 目录（包含 dataset.xlsx 与 images/）")
+        if p:
+            self.fields["root"].var.set(p)
+
     def on_pick_input(self) -> None:
         p = filedialog.askopenfilename(title="选择数据集 xlsx", filetypes=[("Excel", "*.xlsx"), ("All", "*")])
         if p:
@@ -558,12 +567,18 @@ class ParamToolApp:
     def _validate_before_run(self, cfg: Dict[str, Any]) -> Tuple[bool, str]:
         if not os.path.exists(EVAL_SCRIPT):
             return False, f"找不到脚本：{EVAL_SCRIPT}"
-        inp = cfg.get("input")
-        if not inp:
-            return False, "必须填写 --input"
-        # Allow non-existent on Linux? For Windows internal tool, validate.
-        if not os.path.exists(str(inp)):
-            return False, f"--input 不存在：{inp}"
+        root = (cfg.get("root") or "").strip()
+        inp = (cfg.get("input") or "").strip()
+        if not root and not inp:
+            return False, "必须填写 --root 或 --input"
+        if inp:
+            # Allow non-existent on Linux? For Windows internal tool, validate.
+            if not os.path.exists(str(inp)):
+                return False, f"--input 不存在：{inp}"
+        else:
+            dataset = os.path.join(root, "dataset.xlsx")
+            if not os.path.exists(dataset):
+                return False, f"--root 下找不到 dataset.xlsx：{dataset}"
         return True, ""
 
     def on_generate_cmd(self) -> None:
@@ -618,6 +633,7 @@ class ParamToolApp:
         # Known flags mapping
         value_flags: Dict[str, str] = {
             "--config": "config",
+            "--root": "root",
             "--input": "input",
             "--sheet": "sheet",
             "--images-root": "images_root",

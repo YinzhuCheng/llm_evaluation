@@ -49,6 +49,12 @@ def strip_base64_payloads(text: str) -> str:
     s = _LONG_B64_TOKEN_RE.sub("<base64_omitted>", s)
     return s
 
+def is_nan(x: Any) -> bool:
+    try:
+        return isinstance(x, float) and pd.isna(x)
+    except Exception:
+        return False
+
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -105,6 +111,37 @@ def image_file_to_data_url(image_path: str) -> Optional[str]:
     with open(image_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("utf-8")
     return f"data:{mime};base64,{b64}"
+
+def resolve_image_path(images_root: str, img_value: Any) -> Optional[str]:
+    """
+    Resolve an image file path from a dataset cell value.
+    Supports:
+    - absolute paths
+    - relative paths like "images/xxx.jpg"
+    - bare filenames like "xxx.jpg" (will also try <images_root>/images/xxx.jpg)
+    """
+    if img_value is None or is_nan(img_value):
+        return None
+    img_rel = str(img_value).strip()
+    if not img_rel or img_rel.lower() == "nan":
+        return None
+
+    if os.path.isabs(img_rel):
+        return img_rel
+
+    root = (images_root or "").strip()
+    if not root:
+        return img_rel
+
+    p1 = os.path.join(root, img_rel)
+    if os.path.exists(p1):
+        return p1
+
+    p2 = os.path.join(root, "images", img_rel)
+    if os.path.exists(p2):
+        return p2
+
+    return p1
 
 def extract_letters_csv(text: str) -> Optional[str]:
     """
@@ -788,18 +825,18 @@ def parse_judge_json(text: str) -> Dict[str, Any]:
         # 解析 "verdict" 字段
         verdict = judge_json.get("verdict", "").lower()
 
-        # 根据 "verdict" 判断结果
-        if verdict == "correct":
-            judge_json["judge_correct"] = True
-        elif verdict == "incorrect":
-            judge_json["judge_correct"] = False
-        else:
-            judge_json["judge_correct"] = None
+        # Metric policy: unjudgeable counts as incorrect.
+        judge_json["judge_correct"] = (verdict == "correct")
 
         return judge_json
     except Exception as e:
         # 如果解析失败，返回一个默认的结果
-        return {"verdict": "unjudgeable", "extracted_answer": None, "reason": f"Failed to parse judge JSON: {str(e)}"}
+        return {
+            "verdict": "unjudgeable",
+            "extracted_answer": None,
+            "reason": f"Failed to parse judge JSON: {str(e)}",
+            "judge_correct": False,
+        }
 
 
 # ----------------------------
@@ -827,7 +864,7 @@ async def eval_one(
     gold_raw = str(row.get("Answer", "")).strip()
     gold_norm = normalize_csv_letters(gold_raw) if mcq else gold_raw
 
-    img_rel = str(row.get("Image", "") or "").strip()
+    img_cell = row.get("Image", None)
     img_dep = int(row.get("Image_Dependency", 0) or 0)
 
     cot_on = (run_cfg.cot == "on")
@@ -835,15 +872,15 @@ async def eval_one(
     # Resolve image
     image_path = None
     image_data_url = None
-    if img_rel:
-        image_path = img_rel
-        if run_cfg.images_root:
-            image_path = os.path.join(run_cfg.images_root, img_rel) if not os.path.isabs(img_rel) else img_rel
-        if os.path.exists(image_path):
-            image_data_url = image_file_to_data_url(image_path)
+    image_path = resolve_image_path(run_cfg.images_root, img_cell)
+    if image_path and os.path.exists(image_path):
+        image_data_url = image_file_to_data_url(image_path)
 
     # Skip if image required but missing
     if img_dep == 1 and not image_data_url and run_cfg.skip_image_missing:
+        img_preview = ""
+        if img_cell is not None and not is_nan(img_cell):
+            img_preview = str(img_cell).strip()
         out = {
             "id": qid,
             "idx": idx,
@@ -863,7 +900,7 @@ async def eval_one(
         }
         async with write_lock:
             safe_jsonl_append(results_path, out)
-        print(f"[{idx}/{total}] id={qid}  SKIP(image missing)  gold={gold_norm}  image={img_rel}", flush=True)
+        print(f"[{idx}/{total}] id={qid}  SKIP(image missing)  gold={gold_norm}  image={img_preview}", flush=True)
         return out
 
     base_prompt = build_mcq_prompt(question, options, cot_on=cot_on) if mcq else build_freeform_answer_prompt(question, cot_on=cot_on)
@@ -926,13 +963,8 @@ async def eval_one(
         judge_call_log = _sanitize_call_for_logging(judge_provider.cfg.provider, judge_call, image_path=None)
         judge_json = parse_judge_json(judge_text)
         verdict = str(judge_json.get("verdict", "unjudgeable")).lower()
-
-        if verdict == "correct":
-            judge_correct = True
-        elif verdict == "incorrect":
-            judge_correct = False
-        else:
-            judge_correct = None
+        # Metric policy: unjudgeable counts as incorrect.
+        judge_correct = (verdict == "correct")
 
         extracted = judge_json.get("extracted_answer", None)
         extracted_norm = normalize_csv_letters(extracted) if isinstance(extracted, str) else ""
@@ -944,7 +976,8 @@ async def eval_one(
             "judge_latency_ms": jt1 - jt0,
         }
     else:
-        judge_correct = None
+        # No judge result (e.g., answering JSON failed) => count as incorrect.
+        judge_correct = False
 
     out = {
         "id": qid,
@@ -1050,21 +1083,13 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     results = await asyncio.gather(*tasks)
 
     # Final correctness is ALWAYS determined by judge_correct for ALL question types.
-    # ============= METRICS (judge-only) =============
-    def _is_nan(x: Any) -> bool:
-        try:
-            return isinstance(x, float) and pd.isna(x)
-        except Exception:
-            return False
-
+    # Metric policy: unjudgeable counts as incorrect.
+    # ============= METRICS (single accuracy) =============
     def _norm_group_value(v: Any) -> str:
-        if v is None or _is_nan(v):
+        if v is None or is_nan(v):
             return "<missing>"
         s = str(v).strip()
         return s if s else "<missing>"
-
-    def _acc(correct: int, denom: int) -> float:
-        return (correct / denom) if denom else 0.0
 
     def _fmt_pct(x: float) -> str:
         return f"{x * 100.0:.2f}%"
@@ -1072,33 +1097,29 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     def _group_breakdown(rows_in: List[Dict[str, Any]], key: str) -> Dict[str, Any]:
         """
         Group-by breakdown over *non-skipped* rows.
-        model_correct: True/False/None (None = unjudgeable)
+        model_correct: True/False (unjudgeable already mapped to False)
         """
         buckets: Dict[str, Dict[str, int]] = {}
         for r in rows_in:
             if r.get("skipped"):
                 continue
             g = _norm_group_value(r.get(key))
-            b = buckets.setdefault(g, {"total": 0, "correct": 0, "incorrect": 0, "unjudgeable": 0})
+            b = buckets.setdefault(g, {"total": 0, "correct": 0, "incorrect": 0})
             b["total"] += 1
             mc = r.get("model_correct")
             if mc is True:
                 b["correct"] += 1
-            elif mc is False:
-                b["incorrect"] += 1
             else:
-                b["unjudgeable"] += 1
+                b["incorrect"] += 1
 
         out: Dict[str, Any] = {}
         for g, b in buckets.items():
-            judged = b["correct"] + b["incorrect"]
+            total = b["total"]
+            acc = (b["correct"] / total) if total else 0.0
             out[g] = {
                 **b,
-                "judged": judged,
-                "accuracy_judged": _acc(b["correct"], judged),
-                "accuracy_judged_str": _fmt_pct(_acc(b["correct"], judged)),
-                "accuracy_all": _acc(b["correct"], b["total"]),
-                "accuracy_all_str": _fmt_pct(_acc(b["correct"], b["total"])),
+                "accuracy": acc,
+                "accuracy_str": _fmt_pct(acc),
             }
         return out
 
@@ -1116,25 +1137,20 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
             row["model_correct"] = None
             continue
 
-        # 写回表格：统一用 judge_correct（True/False/None）
-        row["model_correct"] = result.get("judge_correct")
+        # 写回表格：统一用 judge_correct（True/False），unjudgeable 已计为 False
+        row["model_correct"] = bool(result.get("judge_correct"))
 
     overall_total = sum(1 for r in rows if not r.get("skipped"))
     overall_correct = sum(1 for r in rows if (not r.get("skipped")) and r.get("model_correct") is True)
-    overall_incorrect = sum(1 for r in rows if (not r.get("skipped")) and r.get("model_correct") is False)
-    overall_unjudgeable = sum(1 for r in rows if (not r.get("skipped")) and r.get("model_correct") is None)
-    overall_judged = overall_correct + overall_incorrect
+    overall_incorrect = overall_total - overall_correct
+    overall_acc = (overall_correct / overall_total) if overall_total else 0.0
 
     overall = {
         "correct": overall_correct,
         "incorrect": overall_incorrect,
-        "unjudgeable": overall_unjudgeable,
         "total": overall_total,
-        "judged": overall_judged,
-        "accuracy_judged": _acc(overall_correct, overall_judged),
-        "accuracy_judged_str": _fmt_pct(_acc(overall_correct, overall_judged)),
-        "accuracy_all": _acc(overall_correct, overall_total),
-        "accuracy_all_str": _fmt_pct(_acc(overall_correct, overall_total)),
+        "accuracy": overall_acc,
+        "accuracy_str": _fmt_pct(overall_acc),
     }
 
     # Breakdowns (only if the corresponding column exists in the dataset)
@@ -1219,8 +1235,7 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 
     print("\n=== Scores ===", flush=True)
-    print(f"Overall (accuracy_judged): {overall.get('accuracy_judged_str')}", flush=True)
-    print(f"Overall (accuracy_all): {overall.get('accuracy_all_str')}", flush=True)
+    print(f"Overall (accuracy): {overall.get('accuracy_str')}", flush=True)
 
     print(f"\nSaved full archives to: {results_path}", flush=True)
     print(f"Saved summary to: {summary_path}", flush=True)
@@ -1252,6 +1267,12 @@ def main():
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--config", type=str, default="", help="Optional YAML config.")
+    ap.add_argument(
+        "--root",
+        type=str,
+        default="",
+        help="Convenience: root directory containing dataset.xlsx and images/ (used when --input/--images-root are not provided).",
+    )
     ap.add_argument("--input", type=str, required=False, default="", help="Path to .xlsx dataset.")
     ap.add_argument("--sheet", type=str, default="", help="Sheet name (default: first sheet).")
     ap.add_argument("--images-root", type=str, default="", help="Root directory where 'images/' folder lives.")
@@ -1313,14 +1334,22 @@ def main():
 
     cfg = load_yaml_config(args.config) if args.config else {}
 
+    root_path = (args.root or cfg.get("root_path", "") or "").strip()
+
     input_path = args.input or cfg.get("input_path", "")
+    if not input_path and root_path:
+        input_path = os.path.join(root_path, "dataset.xlsx")
     if not input_path:
-        raise ValueError("Missing --input (xlsx path) or input_path in YAML.")
+        raise ValueError("Missing --input (xlsx path) or input_path/root_path in YAML/CLI.")
 
     sheet_name = args.sheet or cfg.get("sheet_name", "")
     sheet_name = sheet_name if sheet_name else None
 
     images_root = args.images_root or cfg.get("images_root", "")
+    if not images_root and root_path:
+        # Convention: images live under <root>/images/
+        # Keep images_root=<root> so dataset can store "images/xxx.jpg"
+        images_root = root_path
     out_dir = (args.out_dir if args.out_dir is not None else cfg.get("out_dir", "out_eval"))
 
     # model cfg
