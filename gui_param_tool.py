@@ -208,7 +208,7 @@ class ParamToolApp:
         base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(__file__)
         return {
             "cot": "off",
-            "mcq_cardinality_hint": "on",
+            "mcq_cardinality_hint": "off",
             "vpn": "off",
             "proxy": "http://127.0.0.1:7897",
             "concurrency": 1,
@@ -977,6 +977,7 @@ class ParamToolApp:
         cfg = self._get_cfg()
 
         def runner() -> None:
+            self._cancel_event = threading.Event()
             try:
                 self._log_q.put("\n=== CONNECTIVITY TEST ===\n")
                 import asyncio
@@ -999,15 +1000,23 @@ class ParamToolApp:
                     cot=str(cfg.get("cot", "on") or "on"),
                     answer_json_max_attempts=int(cfg.get("answer_json_max_attempts", 1) or 1),
                     majority_vote=1,
+                    mcq_cardinality_hint=str(cfg.get("mcq_cardinality_hint", "off") or "off"),
                     vpn=str(cfg.get("vpn", "off") or "off"),
                     proxy=str(cfg.get("proxy", "") or ""),
                 )
+                run_cfg.cancel_event = self._cancel_event
 
                 async def _test_one(name: str, pcfg: eval_questions.ProviderConfig) -> None:
+                    if self._cancel_event is not None and self._cancel_event.is_set():
+                        self._log_q.put(f"{name}: CANCELLED\n")
+                        return
                     prov = eval_questions.LLMProvider(pcfg, run_cfg)
                     t0 = eval_questions.now_ms()
                     resp = await prov.call("Reply with ONLY a JSON object: {\"ok\": true}", image_data_url=None)
                     t1 = eval_questions.now_ms()
+                    if self._cancel_event is not None and self._cancel_event.is_set():
+                        self._log_q.put(f"{name}: CANCELLED\n")
+                        return
                     err = resp.get("error")
                     st = resp.get("status")
                     if err or (isinstance(st, int) and st >= 400):
@@ -1035,11 +1044,18 @@ class ParamToolApp:
                     max_tokens=16,
                 )
 
-                asyncio.run(_test_one("Model", model_pcfg))
-                asyncio.run(_test_one("Judge", judge_pcfg))
+                async def _main() -> None:
+                    await _test_one("Model", model_pcfg)
+                    if self._cancel_event is not None and self._cancel_event.is_set():
+                        return
+                    await _test_one("Judge", judge_pcfg)
+
+                asyncio.run(_main())
                 self._log_q.put("=== CONNECTIVITY TEST DONE ===\n")
             except Exception as e:
                 self._log_q.put(f"\n=== CONNECTIVITY TEST ERROR: {type(e).__name__}: {e} ===\n")
+            finally:
+                self._cancel_event = None
 
         self._runner_thread = threading.Thread(target=runner, daemon=True)
         self._runner_thread.start()

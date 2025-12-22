@@ -519,7 +519,7 @@ class RunConfig:
 
     # NEW: MCQ prompt hint about single-vs-multi answer (derived from gold Answer)
     # on/off (string for CLI/GUI consistency)
-    mcq_cardinality_hint: str = "on"
+    mcq_cardinality_hint: str = "off"
 
     # vpn/proxy switch
     vpn: str = "off"       # on/off
@@ -1462,25 +1462,39 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
             }
         return out
 
-    # Enrich rows with evaluation fields for downstream grouping / Excel output
-    for result, row in zip(results, rows):
-        row["skipped"] = bool(result.get("skipped"))
-        row["skip_reason"] = result.get("skip_reason")
-        row["question_type_inferred"] = result.get("question_type_inferred")
-        row["answer_json_ok"] = result.get("answer_json_ok")
-        row["answer_json_attempts"] = result.get("answer_json_attempts")
-        row["answer_json_error"] = result.get("answer_json_error")
-        row["pred"] = result.get("pred")
+    # Align results back to question index (tasks complete out-of-order).
+    result_by_idx: Dict[int, Dict[str, Any]] = {}
+    for r in results:
+        try:
+            i = int(r.get("idx") or 0)
+        except Exception:
+            i = 0
+        if i >= 1 and i not in result_by_idx:
+            result_by_idx[i] = r
 
-        if row["skipped"]:
-            row["model_correct"] = None
-            continue
+    # Build a metric-only view of rows (do not mutate the original dataset columns).
+    metric_rows: List[Dict[str, Any]] = []
+    model_correct_list: List[Optional[bool]] = []
+    for i, row in enumerate(rows):
+        res = result_by_idx.get(i + 1) or {}
+        skipped = bool(res.get("skipped"))
+        judge_correct = res.get("judge_correct")
+        if skipped:
+            mc_val: Optional[bool] = None
+        else:
+            # write-back: single source of truth is judge_correct (unjudgeable already mapped to False)
+            mc_val = bool(judge_correct)
 
-        # 写回表格：统一用 judge_correct（True/False），unjudgeable 已计为 False
-        row["model_correct"] = bool(result.get("judge_correct"))
+        model_correct_list.append(mc_val)
+        metric = dict(row)
+        metric["skipped"] = skipped
+        metric["skip_reason"] = res.get("skip_reason")
+        metric["question_type_inferred"] = res.get("question_type_inferred")
+        metric["model_correct"] = mc_val
+        metric_rows.append(metric)
 
-    overall_total = sum(1 for r in rows if not r.get("skipped"))
-    overall_correct = sum(1 for r in rows if (not r.get("skipped")) and r.get("model_correct") is True)
+    overall_total = sum(1 for r in metric_rows if not r.get("skipped"))
+    overall_correct = sum(1 for r in metric_rows if (not r.get("skipped")) and r.get("model_correct") is True)
     overall_incorrect = overall_total - overall_correct
     overall_acc = (overall_correct / overall_total) if overall_total else 0.0
 
@@ -1495,14 +1509,14 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     # Breakdowns (only if the corresponding column exists in the dataset)
     cols = set(df.columns)
     breakdowns: Dict[str, Any] = {
-        "by_question_type_inferred": _group_breakdown(rows, "question_type_inferred"),
+        "by_question_type_inferred": _group_breakdown(metric_rows, "question_type_inferred"),
     }
     if "Image_Dependency" in cols:
-        breakdowns["by_image_dependency"] = _group_breakdown(rows, "Image_Dependency")
+        breakdowns["by_image_dependency"] = _group_breakdown(metric_rows, "Image_Dependency")
     if "Subfield" in cols:
-        breakdowns["by_subfield"] = _group_breakdown(rows, "Subfield")
+        breakdowns["by_subfield"] = _group_breakdown(metric_rows, "Subfield")
     if "Academic_Level" in cols:
-        breakdowns["by_academic_level"] = _group_breakdown(rows, "Academic_Level")
+        breakdowns["by_academic_level"] = _group_breakdown(metric_rows, "Academic_Level")
 
     # Best-effort: field/domain and difficulty columns may vary by dataset.
     # We pick the first matching column name in a common candidate list.
@@ -1514,11 +1528,11 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
 
     field_col = _pick_col(["Field", "Domain", "Subject", "领域", "学科", "科目"])
     if field_col:
-        breakdowns["by_field"] = {"column": field_col, "groups": _group_breakdown(rows, field_col)}
+        breakdowns["by_field"] = {"column": field_col, "groups": _group_breakdown(metric_rows, field_col)}
 
     difficulty_col = _pick_col(["Difficulty", "难度", "Level", "Difficult"])
     if difficulty_col:
-        breakdowns["by_difficulty"] = {"column": difficulty_col, "groups": _group_breakdown(rows, difficulty_col)}
+        breakdowns["by_difficulty"] = {"column": difficulty_col, "groups": _group_breakdown(metric_rows, difficulty_col)}
     # =====================================================================
 
     def _print_breakdown(title: str, groups: Dict[str, Any]) -> None:
@@ -1535,9 +1549,13 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
         except Exception:
             return
 
-    # Save results to a new Excel file (even if cancelled, we save partial progress).
+    # Save results to a new Excel file.
+    # Requirement: keep ALL original dataset columns; only add/update `model_correct`.
+    output_df = df.copy()
+    if run_cfg.limit is not None:
+        output_df = output_df.head(int(run_cfg.limit))
+    output_df["model_correct"] = model_correct_list
     # Robustness: clean illegal control characters that openpyxl rejects.
-    output_df = pd.DataFrame(rows)
     for col in output_df.columns:
         if output_df[col].dtype == "object":
             output_df[col] = output_df[col].map(_excel_safe_cell)
@@ -1848,7 +1866,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
         mcq_cardinality_hint=str(
             args.mcq_cardinality_hint
             if args.mcq_cardinality_hint is not None
-            else cfg.get("mcq_cardinality_hint", "on")
+            else cfg.get("mcq_cardinality_hint", "off")
         ),
         vpn=(args.vpn if args.vpn is not None else cfg.get("vpn", "off")),
         proxy=args.proxy or cfg.get("proxy", ""),

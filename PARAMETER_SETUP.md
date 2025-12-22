@@ -115,9 +115,9 @@ python eval_questions.py \
 - **作用**：在选择题提示词中告知答题模型“本题答案是单选还是多选（多于一个选项）”。  
   - 单选：提示 “EXACTLY ONE option”
   - 多选：提示 “MORE THAN ONE option”（**不透露具体选几个**）
-- **默认**：`on`
+- **默认**：`off`
 - **取值**：`on` / `off`
-- **YAML**：`mcq_cardinality_hint: on`
+- **YAML**：`mcq_cardinality_hint: off`
 
 ### 2) `--answer-json-max-attempts`（答题 JSON 解析失败重试次数）
 - **作用**：当答题模型输出无法解析为 JSON 时，脚本会对同一题进行“内容级重试”（重新询问答题模型要求严格 JSON）。
@@ -176,7 +176,7 @@ retry_max_delay_s: 16.0
 limit:
 
 cot: off
-mcq_cardinality_hint: on
+mcq_cardinality_hint: off
 answer_json_max_attempts: 3
 vpn: off
 proxy: ""
