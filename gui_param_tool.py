@@ -1242,7 +1242,13 @@ class ParamToolApp:
         return s
 
     def _draw_sankey(self, fields: List[str]) -> str:
-        import plotly.graph_objects as go  # local import for packaging
+        try:
+            import plotly.graph_objects as go  # local import for packaging
+        except ModuleNotFoundError as e:
+            raise RuntimeError(
+                "未安装 plotly，无法绘图。请在运行环境中安装 plotly（pip install plotly），"
+                "或如果你在使用打包后的 exe，请在打包机重新执行 build.bat 生成新版本。"
+            ) from e
 
         needs_mc = ("model_correct" in fields)
         df, out_dir = self._load_df_for_plot(require_model_correct=needs_mc)
@@ -1298,7 +1304,13 @@ class ParamToolApp:
         return out_path
 
     def _draw_pie(self, field: str) -> str:
-        import plotly.express as px  # local import for packaging
+        try:
+            import plotly.express as px  # local import for packaging
+        except ModuleNotFoundError as e:
+            raise RuntimeError(
+                "未安装 plotly，无法绘图。请在运行环境中安装 plotly（pip install plotly），"
+                "或如果你在使用打包后的 exe，请在打包机重新执行 build.bat 生成新版本。"
+            ) from e
 
         needs_mc = (field == "model_correct")
         df, out_dir = self._load_df_for_plot(require_model_correct=needs_mc)

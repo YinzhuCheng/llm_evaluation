@@ -28,6 +28,9 @@ python -m PyInstaller ^
   --name "EvalTool" ^
   --windowed ^
   --collect-all "plotly" ^
+  --collect-submodules "plotly" ^
+  --hidden-import "plotly.express" ^
+  --hidden-import "plotly.graph_objects" ^
   --hidden-import "eval_questions" ^
   "gui_param_tool.py"
 
