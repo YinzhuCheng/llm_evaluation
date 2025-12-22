@@ -735,12 +735,19 @@ def extract_text_from_provider_response(provider: str, resp_json: Any) -> str:
 # Prompting
 # ----------------------------
 
-def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
+def build_mcq_prompt(question: str, options: List[str], cot_on: bool, *, multi_answer: Optional[bool] = None) -> str:
     opts = "\n".join(options)
+    if multi_answer is True:
+        cardinality_hint = "Important: The correct answer includes MORE THAN ONE option. Do NOT assume it is single-choice.\n"
+    elif multi_answer is False:
+        cardinality_hint = "Important: The correct answer is EXACTLY ONE option (single-choice).\n"
+    else:
+        cardinality_hint = ""
 
     if cot_on:
         return (
             "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
+            + cardinality_hint +
             "You SHOULD output your chain-of-thought reasoning.\n"
             "Output format rules (STRICT):\n"
             "- Return ONLY a JSON object. No markdown. No extra text.\n"
@@ -757,6 +764,7 @@ def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
 
     return (
         "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
+        + cardinality_hint +
         "Do NOT output chain-of-thought. Provide only the final answer.\n"
         "Output format rules (STRICT):\n"
         "- Return ONLY a JSON object. No markdown. No extra text.\n"
@@ -969,6 +977,18 @@ async def eval_one(
 
     gold_raw = str(row.get("Answer", "")).strip()
     gold_norm = normalize_csv_letters(gold_raw) if mcq else gold_raw
+    multi_answer: Optional[bool] = None
+    if mcq:
+        try:
+            # Hint the answering model about single-vs-multi answer, without revealing which options or how many.
+            # Uses the gold answer as the source of truth.
+            s = csv_to_set(gold_norm)
+            if len(s) >= 2:
+                multi_answer = True
+            elif len(s) == 1:
+                multi_answer = False
+        except Exception:
+            multi_answer = None
 
     img_cell = row.get("Image", None)
     img_dep = int(row.get("Image_Dependency", 0) or 0)
@@ -1009,7 +1029,11 @@ async def eval_one(
         print(f"[{idx}/{total}] id={qid}  SKIP(image missing)  gold={gold_norm}  image={img_preview}", flush=True)
         return out
 
-    base_prompt = build_mcq_prompt(question, options, cot_on=cot_on) if mcq else build_freeform_answer_prompt(question, cot_on=cot_on)
+    base_prompt = (
+        build_mcq_prompt(question, options, cot_on=cot_on, multi_answer=multi_answer)
+        if mcq
+        else build_freeform_answer_prompt(question, cot_on=cot_on)
+    )
 
     async def _answer_once() -> Dict[str, Any]:
         """
