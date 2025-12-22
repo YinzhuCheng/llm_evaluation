@@ -555,6 +555,25 @@ class LLMProvider:
         else:
             raise ValueError(f"Unknown provider: {self.cfg.provider}")
 
+
+def normalize_api_protocol(name: str) -> str:
+    """
+    Normalize user-facing protocol names to internal provider ids.
+    Supported (case-insensitive):
+    - OpenAI -> openai
+    - Anthropic -> claude
+    - Google -> gemini
+    Also accepts legacy ids: openai/claude/gemini
+    """
+    s = (name or "").strip().lower()
+    if s in {"openai"}:
+        return "openai"
+    if s in {"anthropic", "claude"}:
+        return "claude"
+    if s in {"google", "gemini"}:
+        return "gemini"
+    return s
+
     async def _call_openai_chat_completions(self, prompt: str, image_data_url: Optional[str]) -> Dict[str, Any]:
         url = self.cfg.base_url.rstrip("/") + "/v1/chat/completions"
         headers = {"Authorization": f"Bearer {self.cfg.api_key}"}
@@ -1420,8 +1439,8 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
     ap.add_argument("--proxy", type=str, default="",
                     help="Proxy URL, e.g. http://127.0.0.1:7897 or socks5://127.0.0.1:7897")
 
-    # model
-    ap.add_argument("--model-provider", type=str, default="")
+    # model (protocol/provider)
+    ap.add_argument("--model-provider", "--api-protocol", dest="model_provider", type=str, default="")
     ap.add_argument("--model-base-url", type=str, default="")
     ap.add_argument("--model-api-key", type=str, default="")
     ap.add_argument("--model-name", type=str, default="")
@@ -1435,7 +1454,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
         action="store_true",
         help="DEPRECATED (no-op). Scoring always uses the judge model.",
     )
-    ap.add_argument("--judge-provider", type=str, default="")
+    ap.add_argument("--judge-provider", "--judge-api-protocol", dest="judge_provider", type=str, default="")
     ap.add_argument("--judge-base-url", type=str, default="")
     ap.add_argument("--judge-api-key", type=str, default="")
     ap.add_argument("--judge-name", type=str, default="")
@@ -1467,7 +1486,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
 
     # model cfg
     model_dict = {
-        "model_provider": args.model_provider or cfg.get("model", {}).get("provider", "openai"),
+        "model_provider": normalize_api_protocol(args.model_provider or cfg.get("model", {}).get("provider", "openai")),
         "model_base_url": args.model_base_url or cfg.get("model", {}).get("base_url", "https://api.openai.com"),
         "model_api_key": args.model_api_key or cfg.get("model", {}).get("api_key", os.getenv("OPENAI_API_KEY", "")),
         "model_model": args.model_name or cfg.get("model", {}).get("model", ""),
@@ -1506,7 +1525,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
 
     # judge cfg (ALWAYS ON): scoring always uses judge model now.
     judge_dict = {
-        "judge_provider": args.judge_provider or cfg.get("judge", {}).get("provider", model_cfg.provider),
+        "judge_provider": normalize_api_protocol(args.judge_provider or cfg.get("judge", {}).get("provider", model_cfg.provider)),
         "judge_base_url": args.judge_base_url or cfg.get("judge", {}).get("base_url", model_cfg.base_url),
         "judge_api_key": (
             args.judge_api_key

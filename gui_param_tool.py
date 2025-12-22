@@ -108,7 +108,7 @@ def _build_arg_list(cfg: Dict[str, Any]) -> List[str]:
     add("--proxy", cfg.get("proxy"))
 
     # Model
-    add("--model-provider", cfg.get("model_provider"))
+    add("--api-protocol", cfg.get("model_provider"))
     add("--model-base-url", cfg.get("model_base_url"))
     add("--model-api-key", cfg.get("model_api_key"))
     add("--model-name", cfg.get("model_name"))
@@ -117,7 +117,7 @@ def _build_arg_list(cfg: Dict[str, Any]) -> List[str]:
     add("--model-max-tokens", cfg.get("model_max_tokens"))
 
     # Judge
-    add("--judge-provider", cfg.get("judge_provider"))
+    add("--judge-api-protocol", cfg.get("judge_provider"))
     add("--judge-base-url", cfg.get("judge_base_url"))
     add("--judge-api-key", cfg.get("judge_api_key"))
     add("--judge-name", cfg.get("judge_name"))
@@ -218,8 +218,8 @@ class ParamToolApp:
             "answer_json_max_attempts": 3,
             "majority_vote": 1,
             "out_dir": os.path.join(base_dir, "runout"),
-            "model_provider": "openai",
-            "judge_provider": "openai",
+            "model_provider": "OpenAI",
+            "judge_provider": "OpenAI",
         }
 
     # ---------- UI ----------
@@ -362,7 +362,15 @@ class ParamToolApp:
         model = ttk.LabelFrame(parent, text="被测模型 (Model)", padding=10)
         model.pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
         r = 0
-        self._add_field("model_provider", "--model-provider (答题模型协议/厂商)", r, model, kind="combo", values=["openai", "gemini", "claude"], width=12); r += 1
+        self._add_field(
+            "model_provider",
+            "--api-protocol (API协议/厂商：OpenAI/Anthropic/Google)",
+            r,
+            model,
+            kind="combo",
+            values=["OpenAI", "Anthropic", "Google"],
+            width=12,
+        ); r += 1
         self._add_field("model_base_url", "--model-base-url (接口地址，如 https://api.openai.com)", r, model); r += 1
         self.show_model_key = tk.BooleanVar(value=False)
         self._add_secret_field("model_api_key", "--model-api-key (答题模型密钥)", r, model, self.show_model_key); r += 1
@@ -374,7 +382,15 @@ class ParamToolApp:
         r = 0
         ttk.Button(judge, text="一键复制被测模型设置", command=self.on_copy_model_to_judge).grid(row=r, column=0, sticky=tk.W, pady=3)
         r += 1
-        self._add_field("judge_provider", "--judge-provider (裁判模型协议/厂商)", r, judge, kind="combo", values=["openai", "gemini", "claude"], width=12); r += 1
+        self._add_field(
+            "judge_provider",
+            "--judge-api-protocol (API协议/厂商：OpenAI/Anthropic/Google)",
+            r,
+            judge,
+            kind="combo",
+            values=["OpenAI", "Anthropic", "Google"],
+            width=12,
+        ); r += 1
         self._add_field("judge_base_url", "--judge-base-url (接口地址)", r, judge); r += 1
         self.show_judge_key = tk.BooleanVar(value=False)
         self._add_secret_field("judge_api_key", "--judge-api-key (裁判模型密钥)", r, judge, self.show_judge_key); r += 1
@@ -680,6 +696,7 @@ class ParamToolApp:
             "--vpn": "vpn",
             "--proxy": "proxy",
             "--model-provider": "model_provider",
+            "--api-protocol": "model_provider",
             "--model-base-url": "model_base_url",
             "--model-api-key": "model_api_key",
             "--model-name": "model_name",
@@ -687,6 +704,7 @@ class ParamToolApp:
             "--model-temperature": "model_temperature",
             "--model-max-tokens": "model_max_tokens",
             "--judge-provider": "judge_provider",
+            "--judge-api-protocol": "judge_provider",
             "--judge-base-url": "judge_base_url",
             "--judge-api-key": "judge_api_key",
             "--judge-name": "judge_name",
@@ -936,7 +954,7 @@ class ParamToolApp:
 
                 # Use small max_tokens to minimize cost
                 model_pcfg = eval_questions.ProviderConfig(
-                    provider=str(cfg.get("model_provider", "openai") or "openai"),
+                    provider=eval_questions.normalize_api_protocol(str(cfg.get("model_provider", "OpenAI") or "OpenAI")),
                     base_url=str(cfg.get("model_base_url", "") or ""),
                     api_key=str(cfg.get("model_api_key", "") or ""),
                     model=str(cfg.get("model_name", "") or ""),
@@ -945,7 +963,7 @@ class ParamToolApp:
                     max_tokens=16,
                 )
                 judge_pcfg = eval_questions.ProviderConfig(
-                    provider=str(cfg.get("judge_provider", model_pcfg.provider) or model_pcfg.provider),
+                    provider=eval_questions.normalize_api_protocol(str(cfg.get("judge_provider", model_pcfg.provider) or model_pcfg.provider)),
                     base_url=str(cfg.get("judge_base_url", model_pcfg.base_url) or model_pcfg.base_url),
                     api_key=str(cfg.get("judge_api_key", model_pcfg.api_key) or model_pcfg.api_key),
                     model=str(cfg.get("judge_name", model_pcfg.model) or model_pcfg.model),
