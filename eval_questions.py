@@ -6,6 +6,7 @@ import os
 import random
 import re
 import time
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -48,6 +49,12 @@ def strip_base64_payloads(text: str) -> str:
     s = _DATA_URL_B64_RE.sub("data:<omitted>;base64,<omitted>", s)
     s = _LONG_B64_TOKEN_RE.sub("<base64_omitted>", s)
     return s
+
+def is_nan(x: Any) -> bool:
+    try:
+        return isinstance(x, float) and pd.isna(x)
+    except Exception:
+        return False
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -105,6 +112,37 @@ def image_file_to_data_url(image_path: str) -> Optional[str]:
     with open(image_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("utf-8")
     return f"data:{mime};base64,{b64}"
+
+def resolve_image_path(images_root: str, img_value: Any) -> Optional[str]:
+    """
+    Resolve an image file path from a dataset cell value.
+    Supports:
+    - absolute paths
+    - relative paths like "images/xxx.jpg"
+    - bare filenames like "xxx.jpg" (will also try <images_root>/images/xxx.jpg)
+    """
+    if img_value is None or is_nan(img_value):
+        return None
+    img_rel = str(img_value).strip()
+    if not img_rel or img_rel.lower() == "nan":
+        return None
+
+    if os.path.isabs(img_rel):
+        return img_rel
+
+    root = (images_root or "").strip()
+    if not root:
+        return img_rel
+
+    p1 = os.path.join(root, img_rel)
+    if os.path.exists(p1):
+        return p1
+
+    p2 = os.path.join(root, "images", img_rel)
+    if os.path.exists(p2):
+        return p2
+
+    return p1
 
 def extract_letters_csv(text: str) -> Optional[str]:
     """
@@ -405,6 +443,7 @@ class ProviderConfig:
     model: str
     timeout_s: float = 60.0
     temperature: float = 0.0
+    top_p: float = 0.75
     max_tokens: int = 10000
 
 @dataclass
@@ -428,9 +467,15 @@ class RunConfig:
     # NEW: answering-model JSON enforcement retries (content-level, not HTTP retries)
     answer_json_max_attempts: int = 3
 
+    # NEW: majority vote (answering model called N times; take majority answer)
+    majority_vote: int = 1
+
     # vpn/proxy switch
     vpn: str = "off"       # on/off
     proxy: str = ""        # proxy url, e.g. http://127.0.0.1:7897
+
+    # cancellation (best-effort; used by GUI)
+    cancel_event: Optional[threading.Event] = None
 
 
 # ----------------------------
@@ -499,6 +544,8 @@ class LLMProvider:
         self.run_cfg = run_cfg
 
     async def call(self, prompt: str, image_data_url: Optional[str] = None) -> Dict[str, Any]:
+        if self.run_cfg.cancel_event is not None and self.run_cfg.cancel_event.is_set():
+            return {"request": None, "response": None, "error": "cancelled", "attempts": 0, "status": None}
         p = self.cfg.provider.lower()
         if p == "openai":
             return await self._call_openai_chat_completions(prompt, image_data_url)
@@ -524,6 +571,7 @@ class LLMProvider:
         payload = {
             "model": self.cfg.model,
             "temperature": self.cfg.temperature,
+            "top_p": self.cfg.top_p,
             "max_tokens": self.cfg.max_tokens,
             "messages": [
                 {"role": "system", "content": "You are a careful assistant. Follow instructions exactly."},
@@ -559,6 +607,7 @@ class LLMProvider:
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
                 "temperature": self.cfg.temperature,
+                "topP": self.cfg.top_p,
                 "maxOutputTokens": self.cfg.max_tokens,
             },
         }
@@ -598,6 +647,7 @@ class LLMProvider:
             "model": self.cfg.model,
             "max_tokens": self.cfg.max_tokens,
             "temperature": self.cfg.temperature,
+            "top_p": self.cfg.top_p,
             "messages": [{"role": "user", "content": content_blocks}],
         }
 
@@ -623,6 +673,25 @@ class LLMProvider:
             return resp.json()
         except Exception:
             return {"raw_text": resp.text}
+
+
+def normalize_api_protocol(name: str) -> str:
+    """
+    Normalize user-facing protocol names to internal provider ids.
+    Supported (case-insensitive):
+    - OpenAI -> openai
+    - Anthropic -> claude
+    - Google -> gemini
+    Also accepts legacy ids: openai/claude/gemini
+    """
+    s = (name or "").strip().lower()
+    if s in {"openai"}:
+        return "openai"
+    if s in {"anthropic", "claude"}:
+        return "claude"
+    if s in {"google", "gemini"}:
+        return "gemini"
+    return s
 
 
 def extract_text_from_provider_response(provider: str, resp_json: Any) -> str:
@@ -669,10 +738,26 @@ def extract_text_from_provider_response(provider: str, resp_json: Any) -> str:
 def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
     opts = "\n".join(options)
 
-    # Always enforce JSON output to reduce judge tokens and prevent CoT leakage.
+    if cot_on:
+        return (
+            "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
+            "You SHOULD output your chain-of-thought reasoning.\n"
+            "Output format rules (STRICT):\n"
+            "- Return ONLY a JSON object. No markdown. No extra text.\n"
+            "- JSON schema:\n"
+            '{ "answer": "A" | "A,B,C", "cot": string }\n'
+            "- 'answer' must contain ONLY letters among A,B,C,D,E.\n"
+            "- If multiple, separate by comma ',' with NO spaces (example: \"A,B,C\").\n"
+            "- 'cot' is your step-by-step reasoning.\n"
+            "Example:\n"
+            '{ "answer": "B", "cot": "..." }\n\n'
+            f"Question:\n{question}\n\n"
+            f"Options:\n{opts}\n"
+        )
+
     return (
         "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
-        "You may think step-by-step internally, but you MUST NOT output chain-of-thought.\n"
+        "Do NOT output chain-of-thought. Provide only the final answer.\n"
         "Output format rules (STRICT):\n"
         "- Return ONLY a JSON object. No markdown. No extra text.\n"
         "- JSON schema:\n"
@@ -687,10 +772,23 @@ def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
 
 
 def build_freeform_answer_prompt(question: str, cot_on: bool) -> str:
-    # Always enforce JSON output to reduce judge tokens and prevent CoT leakage.
+    if cot_on:
+        return (
+            "Answer the following question.\n"
+            "You SHOULD output your chain-of-thought reasoning.\n"
+            "Output format rules (STRICT):\n"
+            "- Return ONLY a JSON object. No markdown. No extra text.\n"
+            "- JSON schema:\n"
+            '{ "answer": string | number | boolean | list[string], "cot": string }\n'
+            "- 'answer' must be the final result.\n"
+            "- For fill-in with multiple blanks, you may output a list of strings.\n"
+            "- 'cot' is your step-by-step reasoning.\n\n"
+            f"Question:\n{question}\n"
+        )
+
     return (
         "Answer the following question.\n"
-        "You may think step-by-step internally, but you MUST NOT output chain-of-thought.\n"
+        "Do NOT output chain-of-thought. Provide only the final answer.\n"
         "Output format rules (STRICT):\n"
         "- Return ONLY a JSON object. No markdown. No extra text.\n"
         "- JSON schema:\n"
@@ -714,6 +812,29 @@ def build_answer_json_retry_prefix(attempt_idx: int, last_error: str) -> str:
         "Do NOT include markdown fences. Do NOT include any extra text before or after the JSON.\n"
         f"(Retry attempt {attempt_idx})\n\n"
     )
+
+
+def majority_vote_pick(answers: List[str]) -> Optional[str]:
+    """
+    Pick the majority answer from a list of answer strings.
+    - Ignores empty/blank answers
+    - In ties, returns the earliest-seen among the top frequency
+    """
+    cleaned: List[str] = []
+    for a in answers or []:
+        s = str(a or "").strip()
+        if s:
+            cleaned.append(s)
+    if not cleaned:
+        return None
+    counts: Dict[str, int] = {}
+    for s in cleaned:
+        counts[s] = counts.get(s, 0) + 1
+    best = max(counts.values())
+    for s in cleaned:
+        if counts.get(s, 0) == best:
+            return s
+    return cleaned[0]
 
 def build_freeform_judge_prompt(question: str, model_answer: str, gold: str) -> str:
     return (
@@ -788,18 +909,18 @@ def parse_judge_json(text: str) -> Dict[str, Any]:
         # 解析 "verdict" 字段
         verdict = judge_json.get("verdict", "").lower()
 
-        # 根据 "verdict" 判断结果
-        if verdict == "correct":
-            judge_json["judge_correct"] = True
-        elif verdict == "incorrect":
-            judge_json["judge_correct"] = False
-        else:
-            judge_json["judge_correct"] = None
+        # Metric policy: unjudgeable counts as incorrect.
+        judge_json["judge_correct"] = (verdict == "correct")
 
         return judge_json
     except Exception as e:
         # 如果解析失败，返回一个默认的结果
-        return {"verdict": "unjudgeable", "extracted_answer": None, "reason": f"Failed to parse judge JSON: {str(e)}"}
+        return {
+            "verdict": "unjudgeable",
+            "extracted_answer": None,
+            "reason": f"Failed to parse judge JSON: {str(e)}",
+            "judge_correct": False,
+        }
 
 
 # ----------------------------
@@ -818,6 +939,28 @@ async def eval_one(
         write_lock: asyncio.Lock,
         results_path: str,
 ) -> Dict[str, Any]:
+    if run_cfg.cancel_event is not None and run_cfg.cancel_event.is_set():
+        out = {
+            "id": str(row.get("id", "")).strip(),
+            "idx": idx,
+            "total": total,
+            "skipped": True,
+            "skip_reason": "cancelled",
+            "gold_raw": None,
+            "gold": None,
+            "pred_raw": None,
+            "pred": None,
+            "rule_correct": None,
+            "judge_correct": False,
+            "latency_ms": 0,
+            "image_path": None,
+            "model_call": None,
+            "judge_call": None,
+        }
+        async with write_lock:
+            safe_jsonl_append(results_path, out)
+        print(f"[{idx}/{total}] id={out.get('id')}  SKIP(cancelled)", flush=True)
+        return out
     qid = str(row.get("id", "")).strip()
     question = str(row.get("Question", "")).strip()
     options = load_options(row.get("Options", ""))  # 获取选项
@@ -827,7 +970,7 @@ async def eval_one(
     gold_raw = str(row.get("Answer", "")).strip()
     gold_norm = normalize_csv_letters(gold_raw) if mcq else gold_raw
 
-    img_rel = str(row.get("Image", "") or "").strip()
+    img_cell = row.get("Image", None)
     img_dep = int(row.get("Image_Dependency", 0) or 0)
 
     cot_on = (run_cfg.cot == "on")
@@ -835,15 +978,15 @@ async def eval_one(
     # Resolve image
     image_path = None
     image_data_url = None
-    if img_rel:
-        image_path = img_rel
-        if run_cfg.images_root:
-            image_path = os.path.join(run_cfg.images_root, img_rel) if not os.path.isabs(img_rel) else img_rel
-        if os.path.exists(image_path):
-            image_data_url = image_file_to_data_url(image_path)
+    image_path = resolve_image_path(run_cfg.images_root, img_cell)
+    if image_path and os.path.exists(image_path):
+        image_data_url = image_file_to_data_url(image_path)
 
     # Skip if image required but missing
     if img_dep == 1 and not image_data_url and run_cfg.skip_image_missing:
+        img_preview = ""
+        if img_cell is not None and not is_nan(img_cell):
+            img_preview = str(img_cell).strip()
         out = {
             "id": qid,
             "idx": idx,
@@ -863,41 +1006,91 @@ async def eval_one(
         }
         async with write_lock:
             safe_jsonl_append(results_path, out)
-        print(f"[{idx}/{total}] id={qid}  SKIP(image missing)  gold={gold_norm}  image={img_rel}", flush=True)
+        print(f"[{idx}/{total}] id={qid}  SKIP(image missing)  gold={gold_norm}  image={img_preview}", flush=True)
         return out
 
     base_prompt = build_mcq_prompt(question, options, cot_on=cot_on) if mcq else build_freeform_answer_prompt(question, cot_on=cot_on)
 
-    # ---- Answering model: enforce JSON, retry up to N times (content-level) ----
-    model_call = None
-    model_text = ""
-    model_call_log = None
-    answer_obj: Optional[Dict[str, Any]] = None
-    answer_parse_error: Optional[str] = None
-    answer_attempts = 0
+    async def _answer_once() -> Dict[str, Any]:
+        """
+        One answering-model attempt with JSON enforcement retries.
+        Returns a dict containing:
+        - answer (str|None)
+        - answer_json_ok (bool)
+        - answer_json_attempts (int)
+        - answer_json_error (str|None)
+        - model_text (str)
+        - model_call_log (dict|None)
+        - model_latency_ms (int)
+        """
+        model_call = None
+        model_text = ""
+        model_call_log = None
+        answer_obj: Optional[Dict[str, Any]] = None
+        answer_parse_error: Optional[str] = None
+        answer_attempts = 0
 
-    t0 = now_ms()
-    for k in range(max(1, int(run_cfg.answer_json_max_attempts))):
-        answer_attempts = k + 1
-        prompt = base_prompt
-        if k > 0:
-            prompt = build_answer_json_retry_prefix(k + 1, answer_parse_error or "unknown") + base_prompt
+        t0 = now_ms()
+        for k in range(max(1, int(run_cfg.answer_json_max_attempts))):
+            answer_attempts = k + 1
+            prompt = base_prompt
+            if k > 0:
+                prompt = build_answer_json_retry_prefix(k + 1, answer_parse_error or "unknown") + base_prompt
 
-        async with model_sem:
-            model_call = await model_provider.call(prompt=prompt, image_data_url=image_data_url)
+            async with model_sem:
+                model_call = await model_provider.call(prompt=prompt, image_data_url=image_data_url)
 
-        model_text = extract_text_from_provider_response(model_provider.cfg.provider, (model_call or {}).get("response"))
-        model_call_log = _sanitize_call_for_logging(model_provider.cfg.provider, model_call, image_path)
+            model_text = extract_text_from_provider_response(
+                model_provider.cfg.provider, (model_call or {}).get("response")
+            )
+            model_call_log = _sanitize_call_for_logging(model_provider.cfg.provider, model_call, image_path)
 
-        answer_obj, answer_parse_error = parse_answer_json(model_text, mcq=mcq)
+            answer_obj, answer_parse_error = parse_answer_json(model_text, mcq=mcq)
+            if answer_obj is not None:
+                answer_parse_error = None
+                break
+
+        t1 = now_ms()
+        extracted: Optional[str] = None
         if answer_obj is not None:
-            answer_parse_error = None
+            extracted = str(answer_obj.get("answer", "")).strip()
+        return {
+            "answer": extracted,
+            "answer_json_ok": (answer_obj is not None),
+            "answer_json_attempts": answer_attempts,
+            "answer_json_error": answer_parse_error,
+            "model_text": model_text,
+            "model_call_log": model_call_log,
+            "model_latency_ms": (t1 - t0),
+        }
+
+    # ---- Answering model: majority vote over N attempts (N>=1) ----
+    vote_n = max(1, int(getattr(run_cfg, "majority_vote", 1) or 1))
+    t0 = now_ms()
+    vote_runs: List[Dict[str, Any]] = []
+    for _ in range(vote_n):
+        if run_cfg.cancel_event is not None and run_cfg.cancel_event.is_set():
             break
+        vote_runs.append(await _answer_once())
     t1 = now_ms()
 
-    extracted_final_answer: Optional[str] = None
-    if answer_obj is not None:
-        extracted_final_answer = str(answer_obj.get("answer", "")).strip()
+    vote_answers = [r.get("answer") for r in vote_runs if r.get("answer")]
+    extracted_final_answer: Optional[str] = majority_vote_pick([str(x) for x in vote_answers])
+
+    # Winner for logging: first run that matches the final answer, else first run.
+    winner = None
+    for r in vote_runs:
+        if extracted_final_answer and (r.get("answer") == extracted_final_answer):
+            winner = r
+            break
+    if winner is None and vote_runs:
+        winner = vote_runs[0]
+
+    model_text = (winner.get("model_text") if isinstance(winner, dict) else "") or ""
+    model_call_log = (winner.get("model_call_log") if isinstance(winner, dict) else None)
+    answer_json_ok = bool(winner.get("answer_json_ok")) if isinstance(winner, dict) else False
+    answer_attempts = int(winner.get("answer_json_attempts") or 0) if isinstance(winner, dict) else 0
+    answer_parse_error = winner.get("answer_json_error") if isinstance(winner, dict) else None
     rule_correct = None
     judge_call = None
     judge_block = None
@@ -926,13 +1119,8 @@ async def eval_one(
         judge_call_log = _sanitize_call_for_logging(judge_provider.cfg.provider, judge_call, image_path=None)
         judge_json = parse_judge_json(judge_text)
         verdict = str(judge_json.get("verdict", "unjudgeable")).lower()
-
-        if verdict == "correct":
-            judge_correct = True
-        elif verdict == "incorrect":
-            judge_correct = False
-        else:
-            judge_correct = None
+        # Metric policy: unjudgeable counts as incorrect.
+        judge_correct = (verdict == "correct")
 
         extracted = judge_json.get("extracted_answer", None)
         extracted_norm = normalize_csv_letters(extracted) if isinstance(extracted, str) else ""
@@ -944,7 +1132,8 @@ async def eval_one(
             "judge_latency_ms": jt1 - jt0,
         }
     else:
-        judge_correct = None
+        # No judge result (e.g., answering JSON failed) => count as incorrect.
+        judge_correct = False
 
     out = {
         "id": qid,
@@ -957,9 +1146,11 @@ async def eval_one(
         # Canonical prediction is extracted from answering-model JSON (NOT judge extraction).
         "pred_raw": extracted_final_answer,
         "pred": extracted_final_answer,
-        "answer_json_ok": (answer_obj is not None),
+        "answer_json_ok": answer_json_ok,
         "answer_json_attempts": answer_attempts,
         "answer_json_error": answer_parse_error,
+        "majority_vote_n": vote_n,
+        "majority_vote_answers": vote_answers,
         "rule_correct": rule_correct,
         "judge_correct": judge_correct,
         "latency_ms": t1 - t0,
@@ -1031,8 +1222,8 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
 
     total_questions = len(rows)
     print(
-        f"Total questions: {total_questions} | model_concurrency={run_cfg.model_concurrency} | judge_concurrency={run_cfg.judge_concurrency} | vpn={run_cfg.vpn} | cot={run_cfg.cot}",
-        flush=True
+        f"Total questions: {total_questions} | model_concurrency={run_cfg.model_concurrency} | judge_concurrency={run_cfg.judge_concurrency} | vpn={run_cfg.vpn} | cot={run_cfg.cot} | majority_vote={run_cfg.majority_vote}",
+        flush=True,
     )
 
     model_sem = asyncio.Semaphore(run_cfg.model_concurrency)
@@ -1050,21 +1241,13 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     results = await asyncio.gather(*tasks)
 
     # Final correctness is ALWAYS determined by judge_correct for ALL question types.
-    # ============= METRICS (judge-only) =============
-    def _is_nan(x: Any) -> bool:
-        try:
-            return isinstance(x, float) and pd.isna(x)
-        except Exception:
-            return False
-
+    # Metric policy: unjudgeable counts as incorrect.
+    # ============= METRICS (single accuracy) =============
     def _norm_group_value(v: Any) -> str:
-        if v is None or _is_nan(v):
+        if v is None or is_nan(v):
             return "<missing>"
         s = str(v).strip()
         return s if s else "<missing>"
-
-    def _acc(correct: int, denom: int) -> float:
-        return (correct / denom) if denom else 0.0
 
     def _fmt_pct(x: float) -> str:
         return f"{x * 100.0:.2f}%"
@@ -1072,33 +1255,29 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     def _group_breakdown(rows_in: List[Dict[str, Any]], key: str) -> Dict[str, Any]:
         """
         Group-by breakdown over *non-skipped* rows.
-        model_correct: True/False/None (None = unjudgeable)
+        model_correct: True/False (unjudgeable already mapped to False)
         """
         buckets: Dict[str, Dict[str, int]] = {}
         for r in rows_in:
             if r.get("skipped"):
                 continue
             g = _norm_group_value(r.get(key))
-            b = buckets.setdefault(g, {"total": 0, "correct": 0, "incorrect": 0, "unjudgeable": 0})
+            b = buckets.setdefault(g, {"total": 0, "correct": 0, "incorrect": 0})
             b["total"] += 1
             mc = r.get("model_correct")
             if mc is True:
                 b["correct"] += 1
-            elif mc is False:
-                b["incorrect"] += 1
             else:
-                b["unjudgeable"] += 1
+                b["incorrect"] += 1
 
         out: Dict[str, Any] = {}
         for g, b in buckets.items():
-            judged = b["correct"] + b["incorrect"]
+            total = b["total"]
+            acc = (b["correct"] / total) if total else 0.0
             out[g] = {
                 **b,
-                "judged": judged,
-                "accuracy_judged": _acc(b["correct"], judged),
-                "accuracy_judged_str": _fmt_pct(_acc(b["correct"], judged)),
-                "accuracy_all": _acc(b["correct"], b["total"]),
-                "accuracy_all_str": _fmt_pct(_acc(b["correct"], b["total"])),
+                "accuracy": acc,
+                "accuracy_str": _fmt_pct(acc),
             }
         return out
 
@@ -1116,25 +1295,20 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
             row["model_correct"] = None
             continue
 
-        # 写回表格：统一用 judge_correct（True/False/None）
-        row["model_correct"] = result.get("judge_correct")
+        # 写回表格：统一用 judge_correct（True/False），unjudgeable 已计为 False
+        row["model_correct"] = bool(result.get("judge_correct"))
 
     overall_total = sum(1 for r in rows if not r.get("skipped"))
     overall_correct = sum(1 for r in rows if (not r.get("skipped")) and r.get("model_correct") is True)
-    overall_incorrect = sum(1 for r in rows if (not r.get("skipped")) and r.get("model_correct") is False)
-    overall_unjudgeable = sum(1 for r in rows if (not r.get("skipped")) and r.get("model_correct") is None)
-    overall_judged = overall_correct + overall_incorrect
+    overall_incorrect = overall_total - overall_correct
+    overall_acc = (overall_correct / overall_total) if overall_total else 0.0
 
     overall = {
         "correct": overall_correct,
         "incorrect": overall_incorrect,
-        "unjudgeable": overall_unjudgeable,
         "total": overall_total,
-        "judged": overall_judged,
-        "accuracy_judged": _acc(overall_correct, overall_judged),
-        "accuracy_judged_str": _fmt_pct(_acc(overall_correct, overall_judged)),
-        "accuracy_all": _acc(overall_correct, overall_total),
-        "accuracy_all_str": _fmt_pct(_acc(overall_correct, overall_total)),
+        "accuracy": overall_acc,
+        "accuracy_str": _fmt_pct(overall_acc),
     }
 
     # Breakdowns (only if the corresponding column exists in the dataset)
@@ -1219,8 +1393,7 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 
     print("\n=== Scores ===", flush=True)
-    print(f"Overall (accuracy_judged): {overall.get('accuracy_judged_str')}", flush=True)
-    print(f"Overall (accuracy_all): {overall.get('accuracy_all_str')}", flush=True)
+    print(f"Overall (accuracy): {overall.get('accuracy_str')}", flush=True)
 
     print(f"\nSaved full archives to: {results_path}", flush=True)
     print(f"Saved summary to: {summary_path}", flush=True)
@@ -1248,14 +1421,20 @@ def build_provider_cfg(d: Dict[str, Any], prefix: str) -> ProviderConfig:
         max_tokens=max_tokens,
     )
 
-def main():
+def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threading.Event] = None) -> None:
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--config", type=str, default="", help="Optional YAML config.")
+    ap.add_argument(
+        "--root",
+        type=str,
+        default="",
+        help="Convenience: root directory containing dataset.xlsx and images/ (used when --input/--images-root are not provided).",
+    )
     ap.add_argument("--input", type=str, required=False, default="", help="Path to .xlsx dataset.")
     ap.add_argument("--sheet", type=str, default="", help="Sheet name (default: first sheet).")
     ap.add_argument("--images-root", type=str, default="", help="Root directory where 'images/' folder lives.")
-    ap.add_argument("--out-dir", type=str, default=None, help="Output directory (default: from YAML or 'out_eval').")
+    ap.add_argument("--out-dir", type=str, default=None, help="Output directory (default: from YAML or 'out_run').")
     ap.add_argument("--concurrency", type=int, default=None, help="(legacy) default for both model/judge concurrency")
     ap.add_argument("--model-concurrency", type=int, default=None, help="Max in-flight requests to the answering model")
     ap.add_argument("--judge-concurrency", type=int, default=None, help="Max in-flight requests to the judge model")
@@ -1270,7 +1449,7 @@ def main():
         type=str,
         choices=["on", "off"],
         default=None,
-        help="COT mode: on=force JSON output (answer, brief_reason) with NO chain-of-thought; off=answer-only",
+        help="COT mode: on=include chain-of-thought in JSON field 'cot'; off=answer-only (no chain-of-thought).",
     )
 
     ap.add_argument(
@@ -1280,19 +1459,27 @@ def main():
         help="Max attempts to re-ask answering model when JSON parsing fails (content-level retries). Default: 3",
     )
 
+    ap.add_argument(
+        "--majority-vote",
+        type=int,
+        default=None,
+        help="Call answering model N times per question and take majority answer (default: 1).",
+    )
+
     # VPN/proxy switch
     ap.add_argument("--vpn", type=str, choices=["on", "off"], default=None,
                     help="VPN mode switch: on=use proxy, off=direct")
     ap.add_argument("--proxy", type=str, default="",
                     help="Proxy URL, e.g. http://127.0.0.1:7897 or socks5://127.0.0.1:7897")
 
-    # model
-    ap.add_argument("--model-provider", type=str, default="")
+    # model (protocol/provider)
+    ap.add_argument("--model-provider", "--api-protocol", dest="model_provider", type=str, default="")
     ap.add_argument("--model-base-url", type=str, default="")
     ap.add_argument("--model-api-key", type=str, default="")
     ap.add_argument("--model-name", type=str, default="")
     ap.add_argument("--model-timeout-s", type=float, default=None)
     ap.add_argument("--model-temperature", type=float, default=None)
+    ap.add_argument("--model-top-p", type=float, default=None)
     ap.add_argument("--model-max-tokens", type=int, default=None)
 
     # judge (deprecated flag)
@@ -1301,36 +1488,46 @@ def main():
         action="store_true",
         help="DEPRECATED (no-op). Scoring always uses the judge model.",
     )
-    ap.add_argument("--judge-provider", type=str, default="")
+    ap.add_argument("--judge-provider", "--judge-api-protocol", dest="judge_provider", type=str, default="")
     ap.add_argument("--judge-base-url", type=str, default="")
     ap.add_argument("--judge-api-key", type=str, default="")
     ap.add_argument("--judge-name", type=str, default="")
     ap.add_argument("--judge-timeout-s", type=float, default=None)
     ap.add_argument("--judge-temperature", type=float, default=None)
+    ap.add_argument("--judge-top-p", type=float, default=None)
     ap.add_argument("--judge-max-tokens", type=int, default=None)
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     cfg = load_yaml_config(args.config) if args.config else {}
 
+    root_path = (args.root or cfg.get("root_path", "") or "").strip()
+
     input_path = args.input or cfg.get("input_path", "")
+    if not input_path and root_path:
+        input_path = os.path.join(root_path, "dataset.xlsx")
     if not input_path:
-        raise ValueError("Missing --input (xlsx path) or input_path in YAML.")
+        raise ValueError("Missing --input (xlsx path) or input_path/root_path in YAML/CLI.")
 
     sheet_name = args.sheet or cfg.get("sheet_name", "")
     sheet_name = sheet_name if sheet_name else None
 
     images_root = args.images_root or cfg.get("images_root", "")
-    out_dir = (args.out_dir if args.out_dir is not None else cfg.get("out_dir", "out_eval"))
+    if not images_root and root_path:
+        # Convention: images live under <root>/images/
+        # Keep images_root=<root> so dataset can store "images/xxx.jpg"
+        images_root = root_path
+    out_dir = (args.out_dir if args.out_dir is not None else cfg.get("out_dir", "out_run"))
 
     # model cfg
     model_dict = {
-        "model_provider": args.model_provider or cfg.get("model", {}).get("provider", "openai"),
+        "model_provider": normalize_api_protocol(args.model_provider or cfg.get("model", {}).get("provider", "openai")),
         "model_base_url": args.model_base_url or cfg.get("model", {}).get("base_url", "https://api.openai.com"),
         "model_api_key": args.model_api_key or cfg.get("model", {}).get("api_key", os.getenv("OPENAI_API_KEY", "")),
         "model_model": args.model_name or cfg.get("model", {}).get("model", ""),
         "model_timeout_s": (args.model_timeout_s if args.model_timeout_s is not None else cfg.get("model", {}).get("timeout_s", 60.0)),
         "model_temperature": (args.model_temperature if args.model_temperature is not None else cfg.get("model", {}).get("temperature", 0.0)),
+        "model_top_p": (args.model_top_p if args.model_top_p is not None else cfg.get("model", {}).get("top_p", 0.75)),
         "model_max_tokens": (args.model_max_tokens if args.model_max_tokens is not None else cfg.get("model", {}).get("max_tokens", 10000)),
     }
     if not model_dict["model_model"]:
@@ -1347,6 +1544,7 @@ def main():
         "model_model": model_dict["model_model"],
         "model_timeout_s": model_dict["model_timeout_s"],
         "model_temperature": model_dict["model_temperature"],
+        "model_top_p": model_dict["model_top_p"],
         "model_max_tokens": model_dict["model_max_tokens"],
     }
 
@@ -1359,12 +1557,13 @@ def main():
         model=model_dict_for_builder["model_model"],
         timeout_s=float(model_dict_for_builder.get("model_timeout_s", 60.0)),
         temperature=float(model_dict_for_builder.get("model_temperature", 0.0)),
+        top_p=float(model_dict_for_builder.get("model_top_p", 0.75)),
         max_tokens=int(model_dict_for_builder.get("model_max_tokens", 10000)),
     )
 
     # judge cfg (ALWAYS ON): scoring always uses judge model now.
     judge_dict = {
-        "judge_provider": args.judge_provider or cfg.get("judge", {}).get("provider", model_cfg.provider),
+        "judge_provider": normalize_api_protocol(args.judge_provider or cfg.get("judge", {}).get("provider", model_cfg.provider)),
         "judge_base_url": args.judge_base_url or cfg.get("judge", {}).get("base_url", model_cfg.base_url),
         "judge_api_key": (
             args.judge_api_key
@@ -1376,6 +1575,7 @@ def main():
         "judge_temperature": (
             args.judge_temperature if args.judge_temperature is not None else cfg.get("judge", {}).get("temperature", 0.0)
         ),
+        "judge_top_p": (args.judge_top_p if args.judge_top_p is not None else cfg.get("judge", {}).get("top_p", 0.75)),
         "judge_max_tokens": (args.judge_max_tokens if args.judge_max_tokens is not None else cfg.get("judge", {}).get("max_tokens", 10000)),
     }
     if not judge_dict["judge_model"]:
@@ -1390,6 +1590,7 @@ def main():
         model=judge_dict["judge_model"],
         timeout_s=float(judge_dict.get("judge_timeout_s", 60.0)),
         temperature=float(judge_dict.get("judge_temperature", 0.0)),
+        top_p=float(judge_dict.get("judge_top_p", 0.75)),
         max_tokens=int(judge_dict.get("judge_max_tokens", 10000)),
     )
 
@@ -1417,9 +1618,15 @@ def main():
             if args.answer_json_max_attempts is not None
             else cfg.get("answer_json_max_attempts", 3)
         ),
+        majority_vote=int(
+            args.majority_vote
+            if args.majority_vote is not None
+            else cfg.get("majority_vote", 1)
+        ),
         vpn=(args.vpn if args.vpn is not None else cfg.get("vpn", "off")),
         proxy=args.proxy or cfg.get("proxy", ""),
     )
+    run_cfg.cancel_event = cancel_event
 
     # Read xlsx
     df = pd.read_excel(run_cfg.input_path, sheet_name=run_cfg.sheet_name, engine="openpyxl")
@@ -1430,6 +1637,8 @@ def main():
 
     asyncio.run(run_eval(df, model_cfg, judge_cfg, run_cfg))
 
+def main() -> None:
+    cli_main(None, cancel_event=None)
 
 if __name__ == "__main__":
     main()

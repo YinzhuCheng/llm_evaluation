@@ -13,12 +13,18 @@
 
 ## 关键参数（必须/优先配置）
 
-### 1) 数据集输入：`--input`（或 YAML 的 `input_path`）
-- **作用**：指定待评测的 Excel（`.xlsx`）文件。
-- **示例**：`--input data/dataset.xlsx`
+### 1) 数据集输入：`--input` / `--root`（或 YAML 的 `input_path` / `root_path`）
+- **推荐（更省事）**：只给一个“上一级目录” `--root`  
+  - 约定：数据集在 `<root>/dataset.xlsx`，图片在 `<root>/images/`
+- **兼容旧用法**：继续支持 `--input` 指定任意 `.xlsx` 路径
+
+示例：
+- `--root data/待审核数据集`
+- `--input data/dataset.xlsx`
 
 同时可选：
 - **`--sheet`**：指定工作表名称；不填则读取第一个 sheet。
+- **`--images-root`**：图片根目录（可选；如果你使用了 `--root` 且不传它，会自动用 `--root` 作为图片根目录）
 
 ### 2) 被测模型（Model）配置
 这组参数决定“要评测的模型是谁、去哪调用”。
@@ -68,7 +74,7 @@ python eval_questions.py \
 
 ### 4) 输出目录：`--out-dir`
 - **作用**：保存评测产物（jsonl 逐题日志、summary、输出 Excel）。
-- 默认：`out_eval`
+- 默认：`out_run`
 
 ---
 
@@ -95,10 +101,14 @@ python eval_questions.py \
 
 ## 次要参数（可选/调优项）
 
-### 1) `--cot`（兼容保留，当前不再影响输出格式）
-当前版本**始终**要求答题模型返回严格 JSON（只需 `answer` 字段），以便脚本先解析答案再交给裁判，避免把整段输出/推理交给裁判。
+### 1) `--cot`（思维链开关）
+本项目仍然要求答题模型输出**严格 JSON**，以便脚本本地解析出 `answer` 再交给裁判。
 
-> `--cot` 参数目前仅为兼容历史命令行保留；最终判分仍由裁判模型输出的 `verdict` 决定（并写到 `model_correct`）。
+- **`--cot on`**：答题模型输出 JSON 中会包含 `cot` 字段（思维链/推理过程），例如 `{"answer":"B","cot":"..."}`
+- **`--cot off`（默认）**：答题模型只输出答案 JSON（不输出思维链），例如 `{"answer":"B"}`
+
+说明：
+- 无论开关如何，裁判侧仍然只依据最终 `answer` 判定对错（不会把图片/大段内容发给裁判）。
 
 ### 2) `--answer-json-max-attempts`（答题 JSON 解析失败重试次数）
 - **作用**：当答题模型输出无法解析为 JSON 时，脚本会对同一题进行“内容级重试”（重新询问答题模型要求严格 JSON）。
@@ -114,14 +124,19 @@ python eval_questions.py \
 - **`--retry-max-delay-s`**：最大退避延迟（默认 16.0）
 
 ### 4) 抽样/限量：`--limit`
-- 只评测前 N 行，便于快速冒烟测试。
+- 只评测前 N 行，便于快速测试。
 
-### 5) 网络代理（VPN/Proxy）
+### 5) 多数投票：`--majority-vote`
+- **作用**：同一题对答题模型调用 N 次，取**多数答案**作为最终答案（只对最终答案调用一次裁判）。
+- **默认**：1（不投票）
+- **注意**：N 越大，成本与耗时近似线性增加。
+
+### 6) 网络代理（VPN/Proxy）
 - **`--vpn off`（默认）**：直连，并且忽略环境代理变量（`trust_env=False`）。
 - **`--vpn on`**：启用代理；若不填 `--proxy`，默认使用 `http://127.0.0.1:7897`。
 - **`--proxy`**：例如 `http://127.0.0.1:7897` 或 `socks5://127.0.0.1:7897`
 
-### 6) Token/温度/超时（Model/Judge 都可配）
+### 7) Token/温度/超时（Model/Judge 都可配）
 - `--model-max-tokens` / `--judge-max-tokens`
 - `--model-temperature` / `--judge-temperature`
 - `--model-timeout-s` / `--judge-timeout-s`
@@ -135,10 +150,14 @@ python eval_questions.py \
 YAML 示例（字段名与代码读取一致）：
 
 ```yaml
+# 方式1（推荐）：只给 root_path（约定 root 下有 dataset.xlsx 与 images/）
+# root_path: data/待审核数据集
+
+# 方式2：显式给 input_path / images_root
 input_path: data/dataset.xlsx
 sheet_name: Sheet1
 images_root: data
-out_dir: out_eval
+out_dir: out_run
 concurrency: 8
 model_concurrency:
 judge_concurrency:
@@ -186,3 +205,7 @@ python eval_questions.py --config config.yaml
 - `summary_*.json`：整体统计（包含 overall 分数、网络/配置摘要等）
 - `summary_*.json` 还会包含 `breakdowns`：按题型/难度/领域/Image_Dependency（若数据列存在）分组的正确率统计
 - `evaluated_*.xlsx`：把逐题 `model_correct` 写回到 Excel
+
+**指标口径（重要）**：
+- 只保留**单一准确率**（overall accuracy）
+- **裁判返回 unjudgeable 一律按错误计入**（即不会再单独统计 unjudgeable，也不会再区分 judged/all 两套 accuracy）
