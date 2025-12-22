@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import base64
+import datetime as dt
 import json
 import os
 import random
@@ -27,6 +28,52 @@ FINAL_ANSWER_RE = re.compile(
 )
 
 RETRIABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+# Excel (openpyxl) cannot store certain control characters in worksheets.
+# Mirror openpyxl's illegal-char policy:
+# - illegal: 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F
+# - allowed: tab(0x09), LF(0x0A), CR(0x0D)
+_ILLEGAL_EXCEL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+def _excel_safe_str(s: str) -> str:
+    if not s:
+        return ""
+    return _ILLEGAL_EXCEL_CHARS_RE.sub("", s)
+
+def _excel_safe_cell(v: Any) -> Any:
+    """
+    Convert a cell value into something safe for openpyxl.
+    - Keeps numbers/bools/datetime-like as-is
+    - Cleans illegal control chars from strings
+    - Converts dict/list to JSON string then cleans
+    """
+    if v is None:
+        return None
+    try:
+        if is_nan(v):
+            return v
+    except Exception:
+        pass
+
+    if isinstance(v, (bool, int, float)):
+        return v
+    if isinstance(v, (dt.datetime, dt.date, dt.time)):
+        return v
+    # pandas Timestamp / NaT
+    try:
+        if isinstance(v, pd.Timestamp):
+            return v
+    except Exception:
+        pass
+
+    if isinstance(v, str):
+        return _excel_safe_str(v)
+    if isinstance(v, (dict, list)):
+        try:
+            return _excel_safe_str(json.dumps(v, ensure_ascii=False))
+        except Exception:
+            return _excel_safe_str(str(v))
+    return _excel_safe_str(str(v))
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -1393,7 +1440,11 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     # =====================================================================
 
     # Save results to a new Excel file (even if cancelled, we save partial progress).
+    # Robustness: clean illegal control characters that openpyxl rejects.
     output_df = pd.DataFrame(rows)
+    for col in output_df.columns:
+        if output_df[col].dtype == "object":
+            output_df[col] = output_df[col].map(_excel_safe_cell)
     output_df.to_excel(os.path.join(run_dir, f"evaluated_{timestamp}_{model_name_safe}.xlsx"), index=False)
 
     total = len(results)
