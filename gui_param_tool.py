@@ -6,6 +6,8 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import contextlib
+import io
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Optional, Tuple
@@ -155,6 +157,7 @@ class ParamToolApp:
 
         self._runner_thread: Optional[threading.Thread] = None
         self._proc: Optional[subprocess.Popen] = None
+        self._cancel_event: Optional[threading.Event] = None
         self._log_q: "queue.Queue[str]" = queue.Queue()
 
         self._profiles = self._load_profiles()
@@ -769,35 +772,63 @@ class ParamToolApp:
             return
 
         argv = _build_arg_list(cfg)
-        # Run with current interpreter
+        # In frozen (packaged) mode, run eval in-process; otherwise run as a subprocess.
+        is_frozen = bool(getattr(sys, "frozen", False))
         full = [sys.executable] + argv
 
         self._append_log("\n=== RUN ===\n" + _format_cmd_for_display(argv) + "\n")
 
         def runner() -> None:
             try:
-                # Force UTF-8 for stdout decoding on Windows to avoid GBK UnicodeDecodeError.
-                # - encoding/errors affect how *this* process decodes stdout.
-                # - PYTHONIOENCODING/PYTHONUTF8 influence how the child process encodes stdout.
-                child_env = os.environ.copy()
-                child_env.setdefault("PYTHONIOENCODING", "utf-8")
-                child_env.setdefault("PYTHONUTF8", "1")
-                self._proc = subprocess.Popen(
-                    full,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    cwd=os.path.dirname(EVAL_SCRIPT),
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                    env=child_env,
-                )
-                assert self._proc.stdout is not None
-                for line in self._proc.stdout:
-                    self._log_q.put(line)
-                rc = self._proc.wait()
-                self._log_q.put(f"\n=== DONE (exit={rc}) ===\n")
+                if is_frozen:
+                    # Run eval_questions in-process (PyInstaller executable cannot spawn python.exe reliably).
+                    import eval_questions  # type: ignore
+
+                    class _QWriter(io.TextIOBase):
+                        def __init__(self, q: "queue.Queue[str]"):
+                            self.q = q
+
+                        def write(self, s: str) -> int:
+                            if s:
+                                self.q.put(s)
+                            return len(s or "")
+
+                        def flush(self) -> None:
+                            return
+
+                    self._cancel_event = threading.Event()
+                    out = _QWriter(self._log_q)
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                        try:
+                            # argv starts with eval_questions.py; pass flags only.
+                            eval_questions.cli_main(argv[1:], cancel_event=self._cancel_event)
+                            self._log_q.put("\n=== DONE (exit=0) ===\n")
+                        except SystemExit as e:
+                            code = int(getattr(e, "code", 1) or 0)
+                            self._log_q.put(f"\n=== DONE (exit={code}) ===\n")
+                        finally:
+                            self._cancel_event = None
+                else:
+                    # Force UTF-8 for stdout decoding on Windows to avoid GBK UnicodeDecodeError.
+                    child_env = os.environ.copy()
+                    child_env.setdefault("PYTHONIOENCODING", "utf-8")
+                    child_env.setdefault("PYTHONUTF8", "1")
+                    self._proc = subprocess.Popen(
+                        full,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        cwd=os.path.dirname(EVAL_SCRIPT),
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        bufsize=1,
+                        env=child_env,
+                    )
+                    assert self._proc.stdout is not None
+                    for line in self._proc.stdout:
+                        self._log_q.put(line)
+                    rc = self._proc.wait()
+                    self._log_q.put(f"\n=== DONE (exit={rc}) ===\n")
             except Exception as e:
                 self._log_q.put(f"\n=== ERROR: {type(e).__name__}: {e} ===\n")
             finally:
@@ -807,14 +838,20 @@ class ParamToolApp:
         self._runner_thread.start()
 
     def on_stop(self) -> None:
+        # Subprocess mode
         p = self._proc
-        if p is None:
+        if p is not None:
+            try:
+                p.terminate()
+                self._append_log("\n=== STOP requested ===\n")
+            except Exception as e:
+                self._append_log(f"\n=== STOP failed: {type(e).__name__}: {e} ===\n")
             return
-        try:
-            p.terminate()
-            self._append_log("\n=== STOP requested ===\n")
-        except Exception as e:
-            self._append_log(f"\n=== STOP failed: {type(e).__name__}: {e} ===\n")
+
+        # In-process (frozen) mode: best-effort cancellation
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+            self._append_log("\n=== STOP requested (cancel) ===\n")
 
     # ---------- Logging ----------
     def _append_log(self, s: str) -> None:

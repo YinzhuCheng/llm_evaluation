@@ -6,6 +6,7 @@ import os
 import random
 import re
 import time
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 
@@ -469,6 +470,9 @@ class RunConfig:
     vpn: str = "off"       # on/off
     proxy: str = ""        # proxy url, e.g. http://127.0.0.1:7897
 
+    # cancellation (best-effort; used by GUI)
+    cancel_event: Optional[threading.Event] = None
+
 
 # ----------------------------
 # HTTP client & Retry
@@ -536,6 +540,8 @@ class LLMProvider:
         self.run_cfg = run_cfg
 
     async def call(self, prompt: str, image_data_url: Optional[str] = None) -> Dict[str, Any]:
+        if self.run_cfg.cancel_event is not None and self.run_cfg.cancel_event.is_set():
+            return {"request": None, "response": None, "error": "cancelled", "attempts": 0, "status": None}
         p = self.cfg.provider.lower()
         if p == "openai":
             return await self._call_openai_chat_completions(prompt, image_data_url)
@@ -855,6 +861,28 @@ async def eval_one(
         write_lock: asyncio.Lock,
         results_path: str,
 ) -> Dict[str, Any]:
+    if run_cfg.cancel_event is not None and run_cfg.cancel_event.is_set():
+        out = {
+            "id": str(row.get("id", "")).strip(),
+            "idx": idx,
+            "total": total,
+            "skipped": True,
+            "skip_reason": "cancelled",
+            "gold_raw": None,
+            "gold": None,
+            "pred_raw": None,
+            "pred": None,
+            "rule_correct": None,
+            "judge_correct": False,
+            "latency_ms": 0,
+            "image_path": None,
+            "model_call": None,
+            "judge_call": None,
+        }
+        async with write_lock:
+            safe_jsonl_append(results_path, out)
+        print(f"[{idx}/{total}] id={out.get('id')}  SKIP(cancelled)", flush=True)
+        return out
     qid = str(row.get("id", "")).strip()
     question = str(row.get("Question", "")).strip()
     options = load_options(row.get("Options", ""))  # 获取选项
@@ -1263,7 +1291,7 @@ def build_provider_cfg(d: Dict[str, Any], prefix: str) -> ProviderConfig:
         max_tokens=max_tokens,
     )
 
-def main():
+def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threading.Event] = None) -> None:
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--config", type=str, default="", help="Optional YAML config.")
@@ -1330,7 +1358,7 @@ def main():
     ap.add_argument("--judge-temperature", type=float, default=None)
     ap.add_argument("--judge-max-tokens", type=int, default=None)
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     cfg = load_yaml_config(args.config) if args.config else {}
 
@@ -1449,6 +1477,7 @@ def main():
         vpn=(args.vpn if args.vpn is not None else cfg.get("vpn", "off")),
         proxy=args.proxy or cfg.get("proxy", ""),
     )
+    run_cfg.cancel_event = cancel_event
 
     # Read xlsx
     df = pd.read_excel(run_cfg.input_path, sheet_name=run_cfg.sheet_name, engine="openpyxl")
@@ -1459,6 +1488,8 @@ def main():
 
     asyncio.run(run_eval(df, model_cfg, judge_cfg, run_cfg))
 
+def main() -> None:
+    cli_main(None, cancel_event=None)
 
 if __name__ == "__main__":
     main()
