@@ -1493,10 +1493,12 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     breakdowns: Dict[str, Any] = {
         "by_question_type_inferred": _group_breakdown(rows, "question_type_inferred"),
     }
-    if "Question_Type" in cols:
-        breakdowns["by_question_type_raw"] = _group_breakdown(rows, "Question_Type")
     if "Image_Dependency" in cols:
         breakdowns["by_image_dependency"] = _group_breakdown(rows, "Image_Dependency")
+    if "Subfield" in cols:
+        breakdowns["by_subfield"] = _group_breakdown(rows, "Subfield")
+    if "Academic_Level" in cols:
+        breakdowns["by_academic_level"] = _group_breakdown(rows, "Academic_Level")
 
     # Best-effort: field/domain and difficulty columns may vary by dataset.
     # We pick the first matching column name in a common candidate list.
@@ -1514,6 +1516,20 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     if difficulty_col:
         breakdowns["by_difficulty"] = {"column": difficulty_col, "groups": _group_breakdown(rows, difficulty_col)}
     # =====================================================================
+
+    def _print_breakdown(title: str, groups: Dict[str, Any]) -> None:
+        try:
+            items = list(groups.items())
+            items.sort(key=lambda kv: int(kv[1].get("total", 0)), reverse=True)
+            print(f"\n=== Breakdown: {title} ===", flush=True)
+            for name, b in items:
+                total = b.get("total", 0)
+                correct = b.get("correct", 0)
+                incorrect = b.get("incorrect", 0)
+                acc_str = b.get("accuracy_str", "")
+                print(f"- {name}: total={total} correct={correct} incorrect={incorrect} acc={acc_str}", flush=True)
+        except Exception:
+            return
 
     # Save results to a new Excel file (even if cancelled, we save partial progress).
     # Robustness: clean illegal control characters that openpyxl rejects.
@@ -1578,6 +1594,11 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
 
     print("\n=== Scores ===", flush=True)
     print(f"Overall (accuracy): {overall.get('accuracy_str')}", flush=True)
+    # Requested prints
+    if isinstance(breakdowns.get("by_subfield"), dict):
+        _print_breakdown("Subfield", breakdowns["by_subfield"])
+    if isinstance(breakdowns.get("by_academic_level"), dict):
+        _print_breakdown("Academic_Level", breakdowns["by_academic_level"])
 
     print(f"\nSaved full archives to: {results_path}", flush=True)
     print(f"Saved summary to: {summary_path}", flush=True)
