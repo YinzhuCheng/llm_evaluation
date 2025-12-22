@@ -114,6 +114,7 @@ def _build_arg_list(cfg: Dict[str, Any]) -> List[str]:
     add("--model-name", cfg.get("model_name"))
     add("--model-timeout-s", cfg.get("model_timeout_s"))
     add("--model-temperature", cfg.get("model_temperature"))
+    add("--model-top-p", cfg.get("model_top_p"))
     add("--model-max-tokens", cfg.get("model_max_tokens"))
 
     # Judge
@@ -123,6 +124,7 @@ def _build_arg_list(cfg: Dict[str, Any]) -> List[str]:
     add("--judge-name", cfg.get("judge_name"))
     add("--judge-timeout-s", cfg.get("judge_timeout_s"))
     add("--judge-temperature", cfg.get("judge_temperature"))
+    add("--judge-top-p", cfg.get("judge_top_p"))
     add("--judge-max-tokens", cfg.get("judge_max_tokens"))
 
     return args
@@ -217,9 +219,15 @@ class ParamToolApp:
             "max_retries": 3,
             "answer_json_max_attempts": 3,
             "majority_vote": 1,
-            "out_dir": os.path.join(base_dir, "runout"),
+            "out_dir": os.path.join(base_dir, "out_run"),
             "model_provider": "OpenAI",
             "judge_provider": "OpenAI",
+            "model_temperature": 0,
+            "judge_temperature": 0,
+            "model_top_p": 0.75,
+            "judge_top_p": 0.75,
+            "model_max_tokens": 10000,
+            "judge_max_tokens": 10000,
         }
 
     # ---------- UI ----------
@@ -352,7 +360,7 @@ class ParamToolApp:
         ttk.Button(pick, text="选择数据集根目录...", command=self.on_pick_root).pack(fill=tk.X)
 
         self._add_field("cot", "--cot (思维链开关：on=输出cot思维链，off=不输出思维链)", r, main, kind="combo", values=["on", "off"], width=12); r += 1
-        self._add_field("concurrency", "--concurrency (旧并发参数：未单独设置时同时作用于model/judge)", r, main, width=12); r += 1
+        self._add_field("concurrency", "--concurrency (并发数：同时向大模型并发多少条消息)", r, main, width=12); r += 1
         self._add_field("max_retries", "--max-retries (网络/接口失败重试次数，指数退避)", r, main, width=12); r += 1
 
         self._add_field("vpn", "--vpn (如需VPN/代理访问受限API请开启)", r, main, kind="combo", values=["off", "on"], width=12); r += 1
@@ -364,7 +372,7 @@ class ParamToolApp:
         r = 0
         self._add_field(
             "model_provider",
-            "--api-protocol (API协议/厂商：OpenAI/Anthropic/Google)",
+            "--api-protocol (API协议：OpenAI/Anthropic/Google)",
             r,
             model,
             kind="combo",
@@ -384,7 +392,7 @@ class ParamToolApp:
         r += 1
         self._add_field(
             "judge_provider",
-            "--judge-api-protocol (API协议/厂商：OpenAI/Anthropic/Google)",
+            "--judge-api-protocol (API协议：OpenAI/Anthropic/Google)",
             r,
             judge,
             kind="combo",
@@ -416,9 +424,9 @@ class ParamToolApp:
 
         r = 0
         self._add_field("config", "--config (YAML配置文件路径，优先级低于命令行显式参数)", r, left); r += 1
-        self._add_field("out_dir", "--out-dir (结果输出目录，默认 runout/)", r, left); r += 1
+        self._add_field("out_dir", "--out-dir (结果输出目录，默认 out_run/)", r, left); r += 1
         self._add_field("sheet", "--sheet (Excel工作表名，留空=第一个sheet)", r, left); r += 1
-        self._add_field("limit", "--limit (只跑前N题，用于冒烟测试)", r, left, width=12); r += 1
+        self._add_field("limit", "--limit (只跑前N题)", r, left, width=12); r += 1
         self._add_field("answer_json_max_attempts", "--answer-json-max-attempts (答题输出JSON解析失败时的重问次数)", r, left, width=12); r += 1
 
         self._add_field("model_concurrency", "--model-concurrency (答题模型最大并发请求数)", r, left, width=12); r += 1
@@ -428,11 +436,13 @@ class ParamToolApp:
 
         r2 = 0
         self._add_field("model_timeout_s", "--model-timeout-s (答题接口超时秒数)", r2, right, width=12); r2 += 1
-        self._add_field("model_temperature", "--model-temperature (答题采样温度)", r2, right, width=12); r2 += 1
+        self._add_field("model_temperature", "--model-temperature (答题采样温度，默认0)", r2, right, width=12); r2 += 1
+        self._add_field("model_top_p", "--model-top-p (答题top-p，默认0.75)", r2, right, width=12); r2 += 1
         self._add_field("model_max_tokens", "--model-max-tokens (答题最大输出token)", r2, right, width=12); r2 += 1
 
         self._add_field("judge_timeout_s", "--judge-timeout-s (裁判接口超时秒数)", r2, right, width=12); r2 += 1
-        self._add_field("judge_temperature", "--judge-temperature (裁判采样温度)", r2, right, width=12); r2 += 1
+        self._add_field("judge_temperature", "--judge-temperature (裁判采样温度，默认0)", r2, right, width=12); r2 += 1
+        self._add_field("judge_top_p", "--judge-top-p (裁判top-p，默认0.75)", r2, right, width=12); r2 += 1
         self._add_field("judge_max_tokens", "--judge-max-tokens (裁判最大输出token)", r2, right, width=12); r2 += 1
 
         pick = ttk.Frame(left)
@@ -512,8 +522,10 @@ class ParamToolApp:
             "retry_max_delay_s",
             "model_timeout_s",
             "model_temperature",
+            "model_top_p",
             "judge_timeout_s",
             "judge_temperature",
+            "judge_top_p",
         ]:
             v = _float_or_none(get_s(k))
             if v is not None:
@@ -702,6 +714,7 @@ class ParamToolApp:
             "--model-name": "model_name",
             "--model-timeout-s": "model_timeout_s",
             "--model-temperature": "model_temperature",
+            "--model-top-p": "model_top_p",
             "--model-max-tokens": "model_max_tokens",
             "--judge-provider": "judge_provider",
             "--judge-api-protocol": "judge_provider",
@@ -710,6 +723,7 @@ class ParamToolApp:
             "--judge-name": "judge_name",
             "--judge-timeout-s": "judge_timeout_s",
             "--judge-temperature": "judge_temperature",
+            "--judge-top-p": "judge_top_p",
             "--judge-max-tokens": "judge_max_tokens",
         }
         ignored_bool_flags = {"--judge-enable"}  # deprecated/no-op
@@ -730,8 +744,10 @@ class ParamToolApp:
             "retry_max_delay_s",
             "model_timeout_s",
             "model_temperature",
+            "model_top_p",
             "judge_timeout_s",
             "judge_temperature",
+            "judge_top_p",
         }
 
         out: Dict[str, Any] = {}
@@ -1190,7 +1206,7 @@ class ParamToolApp:
         out_dir = (cfg.get("out_dir") or "").strip()
         if not out_dir:
             base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(__file__)
-            out_dir = os.path.join(base_dir, "runout")
+            out_dir = os.path.join(base_dir, "out_run")
         return input_path, out_dir
 
     def _latest_evaluated_xlsx(self, out_dir: str) -> Optional[str]:

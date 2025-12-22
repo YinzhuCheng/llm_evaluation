@@ -443,6 +443,7 @@ class ProviderConfig:
     model: str
     timeout_s: float = 60.0
     temperature: float = 0.0
+    top_p: float = 0.75
     max_tokens: int = 10000
 
 @dataclass
@@ -570,6 +571,7 @@ class LLMProvider:
         payload = {
             "model": self.cfg.model,
             "temperature": self.cfg.temperature,
+            "top_p": self.cfg.top_p,
             "max_tokens": self.cfg.max_tokens,
             "messages": [
                 {"role": "system", "content": "You are a careful assistant. Follow instructions exactly."},
@@ -605,6 +607,7 @@ class LLMProvider:
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
                 "temperature": self.cfg.temperature,
+                "topP": self.cfg.top_p,
                 "maxOutputTokens": self.cfg.max_tokens,
             },
         }
@@ -644,6 +647,7 @@ class LLMProvider:
             "model": self.cfg.model,
             "max_tokens": self.cfg.max_tokens,
             "temperature": self.cfg.temperature,
+            "top_p": self.cfg.top_p,
             "messages": [{"role": "user", "content": content_blocks}],
         }
 
@@ -1475,6 +1479,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
     ap.add_argument("--model-name", type=str, default="")
     ap.add_argument("--model-timeout-s", type=float, default=None)
     ap.add_argument("--model-temperature", type=float, default=None)
+    ap.add_argument("--model-top-p", type=float, default=None)
     ap.add_argument("--model-max-tokens", type=int, default=None)
 
     # judge (deprecated flag)
@@ -1489,6 +1494,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
     ap.add_argument("--judge-name", type=str, default="")
     ap.add_argument("--judge-timeout-s", type=float, default=None)
     ap.add_argument("--judge-temperature", type=float, default=None)
+    ap.add_argument("--judge-top-p", type=float, default=None)
     ap.add_argument("--judge-max-tokens", type=int, default=None)
 
     args = ap.parse_args(argv)
@@ -1521,6 +1527,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
         "model_model": args.model_name or cfg.get("model", {}).get("model", ""),
         "model_timeout_s": (args.model_timeout_s if args.model_timeout_s is not None else cfg.get("model", {}).get("timeout_s", 60.0)),
         "model_temperature": (args.model_temperature if args.model_temperature is not None else cfg.get("model", {}).get("temperature", 0.0)),
+        "model_top_p": (args.model_top_p if args.model_top_p is not None else cfg.get("model", {}).get("top_p", 0.75)),
         "model_max_tokens": (args.model_max_tokens if args.model_max_tokens is not None else cfg.get("model", {}).get("max_tokens", 10000)),
     }
     if not model_dict["model_model"]:
@@ -1537,6 +1544,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
         "model_model": model_dict["model_model"],
         "model_timeout_s": model_dict["model_timeout_s"],
         "model_temperature": model_dict["model_temperature"],
+        "model_top_p": model_dict["model_top_p"],
         "model_max_tokens": model_dict["model_max_tokens"],
     }
 
@@ -1549,6 +1557,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
         model=model_dict_for_builder["model_model"],
         timeout_s=float(model_dict_for_builder.get("model_timeout_s", 60.0)),
         temperature=float(model_dict_for_builder.get("model_temperature", 0.0)),
+        top_p=float(model_dict_for_builder.get("model_top_p", 0.75)),
         max_tokens=int(model_dict_for_builder.get("model_max_tokens", 10000)),
     )
 
@@ -1566,6 +1575,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
         "judge_temperature": (
             args.judge_temperature if args.judge_temperature is not None else cfg.get("judge", {}).get("temperature", 0.0)
         ),
+        "judge_top_p": (args.judge_top_p if args.judge_top_p is not None else cfg.get("judge", {}).get("top_p", 0.75)),
         "judge_max_tokens": (args.judge_max_tokens if args.judge_max_tokens is not None else cfg.get("judge", {}).get("max_tokens", 10000)),
     }
     if not judge_dict["judge_model"]:
@@ -1580,6 +1590,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
         model=judge_dict["judge_model"],
         timeout_s=float(judge_dict.get("judge_timeout_s", 60.0)),
         temperature=float(judge_dict.get("judge_temperature", 0.0)),
+        top_p=float(judge_dict.get("judge_top_p", 0.75)),
         max_tokens=int(judge_dict.get("judge_max_tokens", 10000)),
     )
 
