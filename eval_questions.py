@@ -517,6 +517,10 @@ class RunConfig:
     # NEW: majority vote (answering model called N times; take majority answer)
     majority_vote: int = 1
 
+    # NEW: MCQ prompt hint about single-vs-multi answer (derived from gold Answer)
+    # on/off (string for CLI/GUI consistency)
+    mcq_cardinality_hint: str = "on"
+
     # vpn/proxy switch
     vpn: str = "off"       # on/off
     proxy: str = ""        # proxy url, e.g. http://127.0.0.1:7897
@@ -1025,7 +1029,7 @@ async def eval_one(
     gold_raw = str(row.get("Answer", "")).strip()
     gold_norm = normalize_csv_letters(gold_raw) if mcq else gold_raw
     multi_answer: Optional[bool] = None
-    if mcq:
+    if mcq and (getattr(run_cfg, "mcq_cardinality_hint", "on") == "on"):
         try:
             # Hint the answering model about single-vs-multi answer, without revealing which options or how many.
             # Uses the gold answer as the source of truth.
@@ -1676,6 +1680,14 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
         help="Call answering model N times per question and take majority answer (default: 1).",
     )
 
+    ap.add_argument(
+        "--mcq-cardinality-hint",
+        type=str,
+        choices=["on", "off"],
+        default=None,
+        help="MCQ prompt hint: tell the answering model whether the gold answer is single-choice or multi-choice (on/off). Default: on.",
+    )
+
     # VPN/proxy switch
     ap.add_argument("--vpn", type=str, choices=["on", "off"], default=None,
                     help="VPN mode switch: on=use proxy, off=direct")
@@ -1832,6 +1844,11 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
             args.majority_vote
             if args.majority_vote is not None
             else cfg.get("majority_vote", 1)
+        ),
+        mcq_cardinality_hint=str(
+            args.mcq_cardinality_hint
+            if args.mcq_cardinality_hint is not None
+            else cfg.get("mcq_cardinality_hint", "on")
         ),
         vpn=(args.vpn if args.vpn is not None else cfg.get("vpn", "off")),
         proxy=args.proxy or cfg.get("proxy", ""),

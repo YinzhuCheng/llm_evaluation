@@ -104,6 +104,7 @@ def _build_arg_list(cfg: Dict[str, Any]) -> List[str]:
     add("--cot", cfg.get("cot"))
     add("--answer-json-max-attempts", cfg.get("answer_json_max_attempts"))
     add("--majority-vote", cfg.get("majority_vote"))
+    add("--mcq-cardinality-hint", cfg.get("mcq_cardinality_hint"))
 
     # Network
     add("--vpn", cfg.get("vpn"))
@@ -207,6 +208,7 @@ class ParamToolApp:
         base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(__file__)
         return {
             "cot": "off",
+            "mcq_cardinality_hint": "on",
             "vpn": "off",
             "proxy": "http://127.0.0.1:7897",
             "concurrency": 1,
@@ -354,6 +356,15 @@ class ParamToolApp:
         ttk.Button(pick, text="选择数据集根目录...", command=self.on_pick_root).pack(fill=tk.X)
 
         self._add_field("cot", "--cot (思维链开关：on=输出cot思维链，off=不输出思维链)", r, main, kind="combo", values=["on", "off"], width=12); r += 1
+        self._add_field(
+            "mcq_cardinality_hint",
+            "--mcq-cardinality-hint (选择题提示：告知单选/多选 on/off)",
+            r,
+            main,
+            kind="combo",
+            values=["on", "off"],
+            width=12,
+        ); r += 1
         self._add_field("concurrency", "--concurrency (并发数：同时向大模型并发多少条消息)", r, main, width=12); r += 1
         self._add_field("max_retries", "--max-retries (网络/接口失败重试次数，指数退避)", r, main, width=12); r += 1
 
@@ -489,7 +500,7 @@ class ParamToolApp:
                 cfg[k] = v
 
         # enums
-        for k in ["cot", "vpn", "model_provider", "judge_provider"]:
+        for k in ["cot", "mcq_cardinality_hint", "vpn", "model_provider", "judge_provider"]:
             v = get_s(k)
             if not _is_blank(v):
                 cfg[k] = v
@@ -697,6 +708,7 @@ class ParamToolApp:
             "--retry-max-delay-s": "retry_max_delay_s",
             "--limit": "limit",
             "--cot": "cot",
+            "--mcq-cardinality-hint": "mcq_cardinality_hint",
             "--answer-json-max-attempts": "answer_json_max_attempts",
             "--majority-vote": "majority_vote",
             "--vpn": "vpn",

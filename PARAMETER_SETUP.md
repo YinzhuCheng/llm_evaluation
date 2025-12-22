@@ -111,6 +111,14 @@ python eval_questions.py \
 说明：
 - 无论开关如何，裁判侧仍然只依据最终 `answer` 判定对错（不会把图片/大段内容发给裁判）。
 
+### 1.5) `--mcq-cardinality-hint`（选择题提示：告知单选/多选）
+- **作用**：在选择题提示词中告知答题模型“本题答案是单选还是多选（多于一个选项）”。  
+  - 单选：提示 “EXACTLY ONE option”
+  - 多选：提示 “MORE THAN ONE option”（**不透露具体选几个**）
+- **默认**：`on`
+- **取值**：`on` / `off`
+- **YAML**：`mcq_cardinality_hint: on`
+
 ### 2) `--answer-json-max-attempts`（答题 JSON 解析失败重试次数）
 - **作用**：当答题模型输出无法解析为 JSON 时，脚本会对同一题进行“内容级重试”（重新询问答题模型要求严格 JSON）。
 - **默认**：3
@@ -168,6 +176,7 @@ retry_max_delay_s: 16.0
 limit:
 
 cot: off
+mcq_cardinality_hint: on
 answer_json_max_attempts: 3
 vpn: off
 proxy: ""
