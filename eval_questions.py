@@ -1199,13 +1199,16 @@ async def eval_one(
 
 async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optional[ProviderConfig],
              run_cfg: RunConfig) -> None:
+    # out_dir is the base output directory; each run writes into a timestamp subfolder.
     ensure_dir(run_cfg.out_dir)
 
     # 确保文件名中的非法字符被替换
     model_name_safe = re.sub(r'[<>:"/\\|?*]', '_', model_cfg.model)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    results_path = os.path.join(run_cfg.out_dir, f"results_{timestamp}_{model_name_safe}.jsonl")  # Same file for all logs
-    summary_path = os.path.join(run_cfg.out_dir, f"summary_{timestamp}_{model_name_safe}.json")
+    run_dir = os.path.join(run_cfg.out_dir, timestamp)
+    ensure_dir(run_dir)
+    results_path = os.path.join(run_dir, f"results_{timestamp}_{model_name_safe}.jsonl")  # Same file for all logs
+    summary_path = os.path.join(run_dir, f"summary_{timestamp}_{model_name_safe}.json")
 
     if os.path.exists(results_path):
         os.remove(results_path)
@@ -1229,16 +1232,43 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     model_sem = asyncio.Semaphore(run_cfg.model_concurrency)
     judge_sem = asyncio.Semaphore(run_cfg.judge_concurrency)
 
+    # Create tasks so cancellation can stop in-flight work.
     tasks = [
-        eval_one(
-            r, i + 1, total_questions,
-            model_provider, judge_provider, run_cfg,
-            model_sem, judge_sem,
-            write_lock, results_path
+        asyncio.create_task(
+            eval_one(
+                r, i + 1, total_questions,
+                model_provider, judge_provider, run_cfg,
+                model_sem, judge_sem,
+                write_lock, results_path
+            )
         )
         for i, r in enumerate(rows)
     ]
-    results = await asyncio.gather(*tasks)
+
+    results: List[Dict[str, Any]] = []
+    pending = set(tasks)
+    cancelled = False
+    while pending:
+        if run_cfg.cancel_event is not None and run_cfg.cancel_event.is_set():
+            cancelled = True
+            for t in pending:
+                t.cancel()
+            break
+        done, pending = await asyncio.wait(pending, timeout=0.2, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            try:
+                r = await t
+                if isinstance(r, dict):
+                    results.append(r)
+            except asyncio.CancelledError:
+                continue
+            except Exception as e:
+                # Keep going; record an error marker for summary.
+                results.append({"skipped": True, "skip_reason": f"task_error:{type(e).__name__}:{e}"})
+
+    if cancelled:
+        # Drain cancellation to close sockets promptly.
+        await asyncio.gather(*list(pending), return_exceptions=True)
 
     # Final correctness is ALWAYS determined by judge_correct for ALL question types.
     # Metric policy: unjudgeable counts as incorrect.
@@ -1338,9 +1368,9 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
         breakdowns["by_difficulty"] = {"column": difficulty_col, "groups": _group_breakdown(rows, difficulty_col)}
     # =====================================================================
 
-    # Save results to a new Excel file
+    # Save results to a new Excel file (even if cancelled, we save partial progress).
     output_df = pd.DataFrame(rows)
-    output_df.to_excel(os.path.join(run_cfg.out_dir, f"evaluated_{timestamp}_{model_name_safe}.xlsx"), index=False)
+    output_df.to_excel(os.path.join(run_dir, f"evaluated_{timestamp}_{model_name_safe}.xlsx"), index=False)
 
     total = len(results)
     skipped = sum(1 for r in results if r.get("skipped"))
@@ -1365,6 +1395,9 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
         "skipped": skipped,
         "failed_calls": failed,
         "avg_latency_ms": avg_latency,
+        "cancelled": bool(cancelled),
+        "out_dir_base": run_cfg.out_dir,
+        "run_dir": run_dir,
 
         # judge-only metrics (single source of truth)
         "overall": overall,
@@ -1434,7 +1467,12 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
     ap.add_argument("--input", type=str, required=False, default="", help="Path to .xlsx dataset.")
     ap.add_argument("--sheet", type=str, default="", help="Sheet name (default: first sheet).")
     ap.add_argument("--images-root", type=str, default="", help="Root directory where 'images/' folder lives.")
-    ap.add_argument("--out-dir", type=str, default=None, help="Output directory (default: from YAML or 'out_run').")
+    ap.add_argument(
+        "--out-dir",
+        type=str,
+        default=None,
+        help="Base output directory. Each run writes into a timestamp subfolder under this dir (default: from YAML or 'out_run').",
+    )
     ap.add_argument("--concurrency", type=int, default=None, help="(legacy) default for both model/judge concurrency")
     ap.add_argument("--model-concurrency", type=int, default=None, help="Max in-flight requests to the answering model")
     ap.add_argument("--judge-concurrency", type=int, default=None, help="Max in-flight requests to the judge model")

@@ -8,6 +8,8 @@ import threading
 import tkinter as tk
 import contextlib
 import io
+import signal
+import time
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Optional, Tuple
@@ -155,13 +157,6 @@ class Field:
     var: Any
 
 
-@dataclass
-class PlotRequest:
-    kind: str  # "sankey" | "pie"
-    fields: List[str]  # sankey: ordered fields; pie: [field]
-    needs_model_correct: bool
-
-
 class ParamToolApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -172,7 +167,6 @@ class ParamToolApp:
         self._proc: Optional[subprocess.Popen] = None
         self._cancel_event: Optional[threading.Event] = None
         self._log_q: "queue.Queue[str]" = queue.Queue()
-        self._plot_buffer: List[PlotRequest] = []
         self._last_cfg: Dict[str, Any] = {}
 
         self._profiles = self._load_profiles()
@@ -823,7 +817,7 @@ class ParamToolApp:
         ttk.Button(btns, text="取消", command=dlg.destroy).pack(side=tk.RIGHT, padx=(0, 8))
 
     def on_run(self) -> None:
-        if self._proc is not None:
+        if self._is_running():
             messagebox.showwarning("正在运行", "已有任务在运行中，请先停止或等待完成")
             return
 
@@ -877,6 +871,16 @@ class ParamToolApp:
                     child_env = os.environ.copy()
                     child_env.setdefault("PYTHONIOENCODING", "utf-8")
                     child_env.setdefault("PYTHONUTF8", "1")
+                    creationflags = 0
+                    popen_kwargs: Dict[str, Any] = {}
+                    if os.name == "nt":
+                        # Best-effort: isolate process group so CTRL/CLOSE can target it (may vary by host).
+                        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                        if creationflags:
+                            popen_kwargs["creationflags"] = creationflags
+                    else:
+                        # Create a new session so we can terminate the whole process group.
+                        popen_kwargs["start_new_session"] = True
                     self._proc = subprocess.Popen(
                         full,
                         stdout=subprocess.PIPE,
@@ -887,13 +891,13 @@ class ParamToolApp:
                         errors="replace",
                         bufsize=1,
                         env=child_env,
+                        **popen_kwargs,
                     )
                     assert self._proc.stdout is not None
                     for line in self._proc.stdout:
                         self._log_q.put(line)
                     rc = self._proc.wait()
                     self._log_q.put(f"\n=== DONE (exit={rc}) ===\n")
-                    self._flush_plot_buffer()
             except Exception as e:
                 self._log_q.put(f"\n=== ERROR: {type(e).__name__}: {e} ===\n")
             finally:
@@ -903,20 +907,51 @@ class ParamToolApp:
         self._runner_thread.start()
 
     def on_stop(self) -> None:
-        # Subprocess mode
+        # Subprocess mode (preferred in dev): terminate whole process group, then force-kill if needed.
         p = self._proc
         if p is not None:
-            try:
-                p.terminate()
-                self._append_log("\n=== STOP requested ===\n")
-            except Exception as e:
-                self._append_log(f"\n=== STOP failed: {type(e).__name__}: {e} ===\n")
+            self._append_log("\n=== STOP requested ===\n")
+
+            def killer() -> None:
+                try:
+                    if os.name != "nt":
+                        try:
+                            os.killpg(p.pid, signal.SIGTERM)
+                        except Exception:
+                            p.terminate()
+                    else:
+                        p.terminate()
+
+                    deadline = time.time() + 3.0
+                    while time.time() < deadline:
+                        if p.poll() is not None:
+                            return
+                        time.sleep(0.1)
+
+                    # Still alive: hard kill
+                    if os.name != "nt":
+                        try:
+                            os.killpg(p.pid, signal.SIGKILL)
+                        except Exception:
+                            p.kill()
+                    else:
+                        p.kill()
+                except Exception as e:
+                    self._log_q.put(f"\n=== STOP failed: {type(e).__name__}: {e} ===\n")
+
+            threading.Thread(target=killer, daemon=True).start()
             return
 
-        # In-process (frozen) mode: best-effort cancellation
+        # In-process (frozen) mode: cooperative cancellation.
         if self._cancel_event is not None:
             self._cancel_event.set()
             self._append_log("\n=== STOP requested (cancel) ===\n")
+
+    def _is_running(self) -> bool:
+        if self._proc is not None:
+            return True
+        t = self._runner_thread
+        return bool(t is not None and t.is_alive())
 
     def on_connectivity_test(self) -> None:
         """
@@ -1053,18 +1088,16 @@ class ParamToolApp:
                 messagebox.showwarning("提示", "请至少选择2个字段", parent=dlg)
                 return
             needs_mc = ("model_correct" in fields)
-            if needs_mc and (self._proc is not None or (self._runner_thread is not None and self._runner_thread.is_alive())):
-                self._plot_buffer.append(PlotRequest(kind="sankey", fields=fields, needs_model_correct=True))
-                self._notify_info("已加入队列", "已将桑基图绘制请求压入 buffer，将在本轮评测完成后自动绘制。")
-                dlg.destroy()
-                return
-            if needs_mc and not self._latest_evaluated_xlsx(self._resolve_paths_for_io(self._last_cfg or self._get_cfg())[1]):
-                self._plot_buffer.append(PlotRequest(kind="sankey", fields=fields, needs_model_correct=True))
-                self._notify_info("已加入队列", "当前暂无 model_correct 结果，已压入 buffer，将在评测完成后自动绘制。")
-                dlg.destroy()
-                return
             try:
-                out_path = self._draw_sankey(fields)
+                evaluated_xlsx = None
+                if needs_mc:
+                    evaluated_xlsx = filedialog.askopenfilename(
+                        title="选择模型评测结果 xlsx（包含 model_correct 列）",
+                        filetypes=[("Excel", "*.xlsx"), ("All", "*")],
+                    )
+                    if not evaluated_xlsx:
+                        return
+                out_path = self._draw_sankey(fields, evaluated_xlsx_path=evaluated_xlsx)
                 self._notify_info("绘制成功", f"桑基图已输出：\n{out_path}")
                 dlg.destroy()
             except Exception as e:
@@ -1108,18 +1141,16 @@ class ParamToolApp:
                 messagebox.showwarning("提示", "请选择字段", parent=dlg)
                 return
             needs_mc = (field == "model_correct")
-            if needs_mc and (self._proc is not None or (self._runner_thread is not None and self._runner_thread.is_alive())):
-                self._plot_buffer.append(PlotRequest(kind="pie", fields=[field], needs_model_correct=True))
-                self._notify_info("已加入队列", "已将饼图绘制请求压入 buffer，将在本轮评测完成后自动绘制。")
-                dlg.destroy()
-                return
-            if needs_mc and not self._latest_evaluated_xlsx(self._resolve_paths_for_io(self._last_cfg or self._get_cfg())[1]):
-                self._plot_buffer.append(PlotRequest(kind="pie", fields=[field], needs_model_correct=True))
-                self._notify_info("已加入队列", "当前暂无 model_correct 结果，已压入 buffer，将在评测完成后自动绘制。")
-                dlg.destroy()
-                return
             try:
-                out_path = self._draw_pie(field)
+                evaluated_xlsx = None
+                if needs_mc:
+                    evaluated_xlsx = filedialog.askopenfilename(
+                        title="选择模型评测结果 xlsx（包含 model_correct 列）",
+                        filetypes=[("Excel", "*.xlsx"), ("All", "*")],
+                    )
+                    if not evaluated_xlsx:
+                        return
+                out_path = self._draw_pie(field, evaluated_xlsx_path=evaluated_xlsx)
                 self._notify_info("绘制成功", f"饼图已输出：\n{out_path}")
                 dlg.destroy()
             except Exception as e:
@@ -1209,39 +1240,19 @@ class ParamToolApp:
             out_dir = os.path.join(base_dir, "out_run")
         return input_path, out_dir
 
-    def _latest_evaluated_xlsx(self, out_dir: str) -> Optional[str]:
-        try:
-            if not out_dir or not os.path.isdir(out_dir):
-                return None
-            candidates = []
-            for name in os.listdir(out_dir):
-                if name.startswith("evaluated_") and name.endswith(".xlsx"):
-                    p = os.path.join(out_dir, name)
-                    try:
-                        candidates.append((os.path.getmtime(p), p))
-                    except Exception:
-                        continue
-            if not candidates:
-                return None
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            return candidates[0][1]
-        except Exception:
-            return None
-
-    def _load_df_for_plot(self, *, require_model_correct: bool) -> Tuple[pd.DataFrame, str]:
+    def _load_df_for_plot(self, *, require_model_correct: bool, evaluated_xlsx_path: Optional[str] = None) -> Tuple[pd.DataFrame, str]:
         cfg = self._last_cfg or self._get_cfg()
         input_path, out_dir = self._resolve_paths_for_io(cfg)
-        os.makedirs(out_dir, exist_ok=True)
-
         if require_model_correct:
-            evaluated = self._latest_evaluated_xlsx(out_dir)
-            if not evaluated:
-                raise FileNotFoundError("未找到 evaluated_*.xlsx；请先完成一轮评测或取消选择 model_correct。")
-            df = pd.read_excel(evaluated, engine="openpyxl")
+            if not evaluated_xlsx_path:
+                raise FileNotFoundError("未选择评测结果 xlsx；请选择包含 model_correct 的 evaluated_*.xlsx 文件。")
+            df = pd.read_excel(evaluated_xlsx_path, engine="openpyxl")
+            out_dir = os.path.dirname(evaluated_xlsx_path) or out_dir
         else:
             if not input_path:
                 raise FileNotFoundError("缺少数据集路径；请先填写 --root（推荐）或 --input。")
             df = pd.read_excel(input_path, engine="openpyxl")
+        os.makedirs(out_dir, exist_ok=True)
 
         # Normalize column names (strip)
         df.columns = [str(c).strip() for c in df.columns]
@@ -1257,7 +1268,7 @@ class ParamToolApp:
         s = s.replace({"": "<missing>", "nan": "<missing>", "None": "<missing>"})
         return s
 
-    def _draw_sankey(self, fields: List[str]) -> str:
+    def _draw_sankey(self, fields: List[str], *, evaluated_xlsx_path: Optional[str] = None) -> str:
         try:
             import plotly.graph_objects as go  # local import for packaging
         except ModuleNotFoundError as e:
@@ -1267,7 +1278,7 @@ class ParamToolApp:
             ) from e
 
         needs_mc = ("model_correct" in fields)
-        df, out_dir = self._load_df_for_plot(require_model_correct=needs_mc)
+        df, out_dir = self._load_df_for_plot(require_model_correct=needs_mc, evaluated_xlsx_path=evaluated_xlsx_path)
 
         if len(fields) < 2:
             raise ValueError("桑基图至少需要选择 2 个字段。")
@@ -1319,7 +1330,7 @@ class ParamToolApp:
         fig.write_html(out_path, include_plotlyjs="cdn", full_html=True)
         return out_path
 
-    def _draw_pie(self, field: str) -> str:
+    def _draw_pie(self, field: str, *, evaluated_xlsx_path: Optional[str] = None) -> str:
         try:
             import plotly.express as px  # local import for packaging
         except ModuleNotFoundError as e:
@@ -1329,7 +1340,7 @@ class ParamToolApp:
             ) from e
 
         needs_mc = (field == "model_correct")
-        df, out_dir = self._load_df_for_plot(require_model_correct=needs_mc)
+        df, out_dir = self._load_df_for_plot(require_model_correct=needs_mc, evaluated_xlsx_path=evaluated_xlsx_path)
 
         s = self._sanitize_group_series(df, field)
         vc = s.value_counts().reset_index()
@@ -1340,22 +1351,6 @@ class ParamToolApp:
         out_path = os.path.join(out_dir, f"pie_{ts}_{field}.html")
         fig.write_html(out_path, include_plotlyjs="cdn", full_html=True)
         return out_path
-
-    def _flush_plot_buffer(self) -> None:
-        if not self._plot_buffer:
-            return
-        buf = list(self._plot_buffer)
-        self._plot_buffer.clear()
-        for req in buf:
-            try:
-                if req.kind == "sankey":
-                    path = self._draw_sankey(req.fields)
-                    self._notify_info("绘制成功", f"桑基图已输出：\n{path}")
-                elif req.kind == "pie":
-                    path = self._draw_pie(req.fields[0])
-                    self._notify_info("绘制成功", f"饼图已输出：\n{path}")
-            except Exception as e:
-                self._notify_warn("绘制失败", f"{req.kind} 绘制失败：{type(e).__name__}: {e}")
 
     def _poll_logs(self) -> None:
         try:

@@ -75,6 +75,7 @@ python eval_questions.py \
 ### 4) 输出目录：`--out-dir`
 - **作用**：保存评测产物（jsonl 逐题日志、summary、输出 Excel）。
 - 默认：`out_run`
+- **输出结构**：每次运行会在 `--out-dir` 下创建一个时间戳子目录，例如 `out_run/20251222_101500/`，本次运行的 `results_*.jsonl` / `summary_*.json` / `evaluated_*.xlsx` 都会写入该子目录。
 
 ---
 
@@ -200,7 +201,7 @@ python eval_questions.py --config config.yaml
 
 ## 输出结果会生成什么？
 
-在 `--out-dir` 下会生成：
+在 `--out-dir/<timestamp>/` 下会生成：
 - `results_*.jsonl`：逐题完整日志（包含 model/judge 调用的脱敏请求结构与响应摘要）
 - `summary_*.json`：整体统计（包含 overall 分数、网络/配置摘要等）
 - `summary_*.json` 还会包含 `breakdowns`：按题型/难度/领域/Image_Dependency（若数据列存在）分组的正确率统计
