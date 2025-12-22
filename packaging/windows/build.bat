@@ -27,6 +27,7 @@ python -m PyInstaller ^
   --clean ^
   --name "EvalTool" ^
   --windowed ^
+  --collect-all "plotly" ^
   --hidden-import "eval_questions" ^
   "gui_param_tool.py"
 
