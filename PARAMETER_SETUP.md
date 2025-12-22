@@ -74,7 +74,7 @@ python eval_questions.py \
 
 ### 4) 输出目录：`--out-dir`
 - **作用**：保存评测产物（jsonl 逐题日志、summary、输出 Excel）。
-- 默认：`out_eval`
+- 默认：`out_run`
 
 ---
 
@@ -157,7 +157,7 @@ YAML 示例（字段名与代码读取一致）：
 input_path: data/dataset.xlsx
 sheet_name: Sheet1
 images_root: data
-out_dir: out_eval
+out_dir: out_run
 concurrency: 8
 model_concurrency:
 judge_concurrency:

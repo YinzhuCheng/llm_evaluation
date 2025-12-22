@@ -1434,7 +1434,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
     ap.add_argument("--input", type=str, required=False, default="", help="Path to .xlsx dataset.")
     ap.add_argument("--sheet", type=str, default="", help="Sheet name (default: first sheet).")
     ap.add_argument("--images-root", type=str, default="", help="Root directory where 'images/' folder lives.")
-    ap.add_argument("--out-dir", type=str, default=None, help="Output directory (default: from YAML or 'out_eval').")
+    ap.add_argument("--out-dir", type=str, default=None, help="Output directory (default: from YAML or 'out_run').")
     ap.add_argument("--concurrency", type=int, default=None, help="(legacy) default for both model/judge concurrency")
     ap.add_argument("--model-concurrency", type=int, default=None, help="Max in-flight requests to the answering model")
     ap.add_argument("--judge-concurrency", type=int, default=None, help="Max in-flight requests to the judge model")
@@ -1517,7 +1517,7 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
         # Convention: images live under <root>/images/
         # Keep images_root=<root> so dataset can store "images/xxx.jpg"
         images_root = root_path
-    out_dir = (args.out_dir if args.out_dir is not None else cfg.get("out_dir", "out_eval"))
+    out_dir = (args.out_dir if args.out_dir is not None else cfg.get("out_dir", "out_run"))
 
     # model cfg
     model_dict = {
