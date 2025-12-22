@@ -98,6 +98,7 @@ def _build_arg_list(cfg: Dict[str, Any]) -> List[str]:
     add("--limit", cfg.get("limit"))
     add("--cot", cfg.get("cot"))
     add("--answer-json-max-attempts", cfg.get("answer_json_max_attempts"))
+    add("--majority-vote", cfg.get("majority_vote"))
 
     # Network
     add("--vpn", cfg.get("vpn"))
@@ -152,7 +153,7 @@ class Field:
 class ParamToolApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("Eval 参数工具 (内部版)")
+        root.title("评测小程序")
         root.geometry("1100x720")
 
         self._runner_thread: Optional[threading.Thread] = None
@@ -195,6 +196,7 @@ class ParamToolApp:
         self._set_cfg(self._default_cfg())
 
     def _default_cfg(self) -> Dict[str, Any]:
+        base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(__file__)
         return {
             "cot": "on",
             "vpn": "off",
@@ -202,6 +204,8 @@ class ParamToolApp:
             "concurrency": 1,
             "max_retries": 3,
             "answer_json_max_attempts": 3,
+            "majority_vote": 1,
+            "out_dir": os.path.join(base_dir, "runout"),
             "model_provider": "openai",
             "judge_provider": "openai",
         }
@@ -283,6 +287,7 @@ class ParamToolApp:
 
         ttk.Button(actions, text="生成命令行", command=self.on_generate_cmd).pack(side=tk.TOP, fill=tk.X)
         ttk.Button(actions, text="从命令行导入设置", command=self.on_import_from_cmd).pack(side=tk.TOP, fill=tk.X, pady=6)
+        ttk.Button(actions, text="连通性测试", command=self.on_connectivity_test).pack(side=tk.TOP, fill=tk.X)
         ttk.Button(actions, text="运行", command=self.on_run).pack(side=tk.TOP, fill=tk.X)
         ttk.Button(actions, text="停止", command=self.on_stop).pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
 
@@ -324,24 +329,19 @@ class ParamToolApp:
         main.pack(side=tk.TOP, fill=tk.X)
 
         r = 0
-        self._add_field("root", "--root (上一级目录: dataset.xlsx + images/)", r, main); r += 1
-        self._add_field("input", "--input (数据集xlsx)", r, main); r += 1
-        self._add_field("images_root", "--images-root (图片根目录)", r, main); r += 1
-        self._add_field("out_dir", "--out-dir (输出目录)", r, main); r += 1
+        self._add_field("root", "--root (数据集根目录: dataset.xlsx + images/)", r, main); r += 1
+        self._add_field("majority_vote", "--majority-vote (多数投票调用次数)", r, main, width=12); r += 1
 
         # File pickers
         pick = ttk.Frame(main)
-        pick.grid(row=0, column=2, rowspan=4, padx=(12, 0), sticky=tk.N)
-        ttk.Button(pick, text="选择root目录...", command=self.on_pick_root).pack(fill=tk.X)
-        ttk.Button(pick, text="选择xlsx...", command=self.on_pick_input).pack(fill=tk.X)
-        ttk.Button(pick, text="选择图片目录...", command=self.on_pick_images_root).pack(fill=tk.X, pady=6)
-        ttk.Button(pick, text="选择输出目录...", command=self.on_pick_out_dir).pack(fill=tk.X)
+        pick.grid(row=0, column=2, rowspan=2, padx=(12, 0), sticky=tk.N)
+        ttk.Button(pick, text="选择数据集根目录...", command=self.on_pick_root).pack(fill=tk.X)
 
         self._add_field("cot", "--cot", r, main, kind="combo", values=["on", "off"], width=12); r += 1
         self._add_field("concurrency", "--concurrency", r, main, width=12); r += 1
-        self._add_field("max_retries", "--max-retries", r, main, width=12); r += 1
+        self._add_field("max_retries", "--max-retries (网络/接口失败重试次数)", r, main, width=12); r += 1
 
-        self._add_field("vpn", "--vpn", r, main, kind="combo", values=["off", "on"], width=12); r += 1
+        self._add_field("vpn", "--vpn (如需VPN/代理访问受限API请开启)", r, main, kind="combo", values=["off", "on"], width=12); r += 1
         self._add_field("proxy", "--proxy", r, main); r += 1
 
         # Model
@@ -386,6 +386,7 @@ class ParamToolApp:
 
         r = 0
         self._add_field("config", "--config (YAML)", r, left); r += 1
+        self._add_field("out_dir", "--out-dir (输出目录)", r, left); r += 1
         self._add_field("sheet", "--sheet", r, left); r += 1
         self._add_field("limit", "--limit", r, left, width=12); r += 1
         self._add_field("answer_json_max_attempts", "--answer-json-max-attempts", r, left, width=12); r += 1
@@ -405,8 +406,9 @@ class ParamToolApp:
         self._add_field("judge_max_tokens", "--judge-max-tokens", r2, right, width=12); r2 += 1
 
         pick = ttk.Frame(left)
-        pick.grid(row=0, column=2, rowspan=2, padx=(12, 0), sticky=tk.N)
+        pick.grid(row=0, column=2, rowspan=3, padx=(12, 0), sticky=tk.N)
         ttk.Button(pick, text="选择YAML...", command=self.on_pick_config).pack(fill=tk.X)
+        ttk.Button(pick, text="选择输出目录...", command=self.on_pick_out_dir).pack(fill=tk.X, pady=6)
 
     def _toggle_advanced(self) -> None:
         if self.adv_open.get():
@@ -466,6 +468,7 @@ class ParamToolApp:
             "max_retries",
             "limit",
             "answer_json_max_attempts",
+            "majority_vote",
             "model_max_tokens",
             "judge_max_tokens",
         ]:
@@ -502,7 +505,7 @@ class ParamToolApp:
 
     # ---------- Actions ----------
     def on_pick_root(self) -> None:
-        p = filedialog.askdirectory(title="选择 root 目录（包含 dataset.xlsx 与 images/）")
+        p = filedialog.askdirectory(title="选择数据集根目录（包含 dataset.xlsx 与 images/）")
         if p:
             self.fields["root"].var.set(p)
 
@@ -582,6 +585,14 @@ class ParamToolApp:
             dataset = os.path.join(root, "dataset.xlsx")
             if not os.path.exists(dataset):
                 return False, f"--root 下找不到 dataset.xlsx：{dataset}"
+        mv = cfg.get("majority_vote")
+        if mv is not None:
+            try:
+                mv_i = int(mv)
+                if mv_i < 1:
+                    return False, "--majority-vote 必须为 >= 1"
+            except Exception:
+                return False, "--majority-vote 必须为整数"
         return True, ""
 
     def on_generate_cmd(self) -> None:
@@ -650,6 +661,7 @@ class ParamToolApp:
             "--limit": "limit",
             "--cot": "cot",
             "--answer-json-max-attempts": "answer_json_max_attempts",
+            "--majority-vote": "majority_vote",
             "--vpn": "vpn",
             "--proxy": "proxy",
             "--model-provider": "model_provider",
@@ -676,6 +688,7 @@ class ParamToolApp:
             "max_retries",
             "limit",
             "answer_json_max_attempts",
+            "majority_vote",
             "model_max_tokens",
             "judge_max_tokens",
         }
@@ -852,6 +865,85 @@ class ParamToolApp:
         if self._cancel_event is not None:
             self._cancel_event.set()
             self._append_log("\n=== STOP requested (cancel) ===\n")
+
+    def on_connectivity_test(self) -> None:
+        """
+        Best-effort connectivity test for model/judge settings.
+        Runs in a background thread and logs results to the GUI.
+        """
+        if self._runner_thread is not None and self._runner_thread.is_alive():
+            messagebox.showwarning("正在运行", "有任务在运行中，请等待完成或先停止")
+            return
+
+        cfg = self._get_cfg()
+
+        def runner() -> None:
+            try:
+                self._log_q.put("\n=== CONNECTIVITY TEST ===\n")
+                import asyncio
+                import eval_questions  # type: ignore
+
+                # Build minimal run config for http client settings
+                run_cfg = eval_questions.RunConfig(
+                    input_path="",
+                    sheet_name=None,
+                    images_root=cfg.get("images_root", "") or "",
+                    out_dir=cfg.get("out_dir", "") or "",
+                    concurrency=1,
+                    model_concurrency=1,
+                    judge_concurrency=1,
+                    max_retries=0,
+                    retry_base_delay_s=0.1,
+                    retry_max_delay_s=0.1,
+                    skip_image_missing=True,
+                    limit=None,
+                    cot=str(cfg.get("cot", "on") or "on"),
+                    answer_json_max_attempts=int(cfg.get("answer_json_max_attempts", 1) or 1),
+                    majority_vote=1,
+                    vpn=str(cfg.get("vpn", "off") or "off"),
+                    proxy=str(cfg.get("proxy", "") or ""),
+                )
+
+                async def _test_one(name: str, pcfg: eval_questions.ProviderConfig) -> None:
+                    prov = eval_questions.LLMProvider(pcfg, run_cfg)
+                    t0 = eval_questions.now_ms()
+                    resp = await prov.call("Reply with ONLY a JSON object: {\"ok\": true}", image_data_url=None)
+                    t1 = eval_questions.now_ms()
+                    err = resp.get("error")
+                    st = resp.get("status")
+                    if err or (isinstance(st, int) and st >= 400):
+                        self._log_q.put(f"{name}: FAIL  status={st}  error={err}\n")
+                    else:
+                        self._log_q.put(f"{name}: OK  status={st}  ms={t1 - t0}\n")
+
+                # Use small max_tokens to minimize cost
+                model_pcfg = eval_questions.ProviderConfig(
+                    provider=str(cfg.get("model_provider", "openai") or "openai"),
+                    base_url=str(cfg.get("model_base_url", "") or ""),
+                    api_key=str(cfg.get("model_api_key", "") or ""),
+                    model=str(cfg.get("model_name", "") or ""),
+                    timeout_s=float(cfg.get("model_timeout_s", 20) or 20),
+                    temperature=0.0,
+                    max_tokens=16,
+                )
+                judge_pcfg = eval_questions.ProviderConfig(
+                    provider=str(cfg.get("judge_provider", model_pcfg.provider) or model_pcfg.provider),
+                    base_url=str(cfg.get("judge_base_url", model_pcfg.base_url) or model_pcfg.base_url),
+                    api_key=str(cfg.get("judge_api_key", model_pcfg.api_key) or model_pcfg.api_key),
+                    model=str(cfg.get("judge_name", model_pcfg.model) or model_pcfg.model),
+                    timeout_s=float(cfg.get("judge_timeout_s", 20) or 20),
+                    temperature=0.0,
+                    max_tokens=16,
+                )
+
+                asyncio.run(_test_one("Model", model_pcfg))
+                asyncio.run(_test_one("Judge", judge_pcfg))
+                self._log_q.put("=== CONNECTIVITY TEST DONE ===\n")
+            except Exception as e:
+                self._log_q.put(f"\n=== CONNECTIVITY TEST ERROR: {type(e).__name__}: {e} ===\n")
+
+        self._runner_thread = threading.Thread(target=runner, daemon=True)
+        self._runner_thread.start()
 
     # ---------- Logging ----------
     def _append_log(self, s: str) -> None:

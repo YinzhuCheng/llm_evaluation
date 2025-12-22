@@ -122,12 +122,17 @@ python eval_questions.py \
 ### 4) 抽样/限量：`--limit`
 - 只评测前 N 行，便于快速冒烟测试。
 
-### 5) 网络代理（VPN/Proxy）
+### 5) 多数投票：`--majority-vote`
+- **作用**：同一题对答题模型调用 N 次，取**多数答案**作为最终答案（只对最终答案调用一次裁判）。
+- **默认**：1（不投票）
+- **注意**：N 越大，成本与耗时近似线性增加。
+
+### 6) 网络代理（VPN/Proxy）
 - **`--vpn off`（默认）**：直连，并且忽略环境代理变量（`trust_env=False`）。
 - **`--vpn on`**：启用代理；若不填 `--proxy`，默认使用 `http://127.0.0.1:7897`。
 - **`--proxy`**：例如 `http://127.0.0.1:7897` 或 `socks5://127.0.0.1:7897`
 
-### 6) Token/温度/超时（Model/Judge 都可配）
+### 7) Token/温度/超时（Model/Judge 都可配）
 - `--model-max-tokens` / `--judge-max-tokens`
 - `--model-temperature` / `--judge-temperature`
 - `--model-timeout-s` / `--judge-timeout-s`

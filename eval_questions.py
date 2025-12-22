@@ -466,6 +466,9 @@ class RunConfig:
     # NEW: answering-model JSON enforcement retries (content-level, not HTTP retries)
     answer_json_max_attempts: int = 3
 
+    # NEW: majority vote (answering model called N times; take majority answer)
+    majority_vote: int = 1
+
     # vpn/proxy switch
     vpn: str = "off"       # on/off
     proxy: str = ""        # proxy url, e.g. http://127.0.0.1:7897
@@ -758,6 +761,29 @@ def build_answer_json_retry_prefix(attempt_idx: int, last_error: str) -> str:
         f"(Retry attempt {attempt_idx})\n\n"
     )
 
+
+def majority_vote_pick(answers: List[str]) -> Optional[str]:
+    """
+    Pick the majority answer from a list of answer strings.
+    - Ignores empty/blank answers
+    - In ties, returns the earliest-seen among the top frequency
+    """
+    cleaned: List[str] = []
+    for a in answers or []:
+        s = str(a or "").strip()
+        if s:
+            cleaned.append(s)
+    if not cleaned:
+        return None
+    counts: Dict[str, int] = {}
+    for s in cleaned:
+        counts[s] = counts.get(s, 0) + 1
+    best = max(counts.values())
+    for s in cleaned:
+        if counts.get(s, 0) == best:
+            return s
+    return cleaned[0]
+
 def build_freeform_judge_prompt(question: str, model_answer: str, gold: str) -> str:
     return (
         "You are a strict evaluator. Decide whether the model answer should be counted as correct.\n"
@@ -933,36 +959,86 @@ async def eval_one(
 
     base_prompt = build_mcq_prompt(question, options, cot_on=cot_on) if mcq else build_freeform_answer_prompt(question, cot_on=cot_on)
 
-    # ---- Answering model: enforce JSON, retry up to N times (content-level) ----
-    model_call = None
-    model_text = ""
-    model_call_log = None
-    answer_obj: Optional[Dict[str, Any]] = None
-    answer_parse_error: Optional[str] = None
-    answer_attempts = 0
+    async def _answer_once() -> Dict[str, Any]:
+        """
+        One answering-model attempt with JSON enforcement retries.
+        Returns a dict containing:
+        - answer (str|None)
+        - answer_json_ok (bool)
+        - answer_json_attempts (int)
+        - answer_json_error (str|None)
+        - model_text (str)
+        - model_call_log (dict|None)
+        - model_latency_ms (int)
+        """
+        model_call = None
+        model_text = ""
+        model_call_log = None
+        answer_obj: Optional[Dict[str, Any]] = None
+        answer_parse_error: Optional[str] = None
+        answer_attempts = 0
 
-    t0 = now_ms()
-    for k in range(max(1, int(run_cfg.answer_json_max_attempts))):
-        answer_attempts = k + 1
-        prompt = base_prompt
-        if k > 0:
-            prompt = build_answer_json_retry_prefix(k + 1, answer_parse_error or "unknown") + base_prompt
+        t0 = now_ms()
+        for k in range(max(1, int(run_cfg.answer_json_max_attempts))):
+            answer_attempts = k + 1
+            prompt = base_prompt
+            if k > 0:
+                prompt = build_answer_json_retry_prefix(k + 1, answer_parse_error or "unknown") + base_prompt
 
-        async with model_sem:
-            model_call = await model_provider.call(prompt=prompt, image_data_url=image_data_url)
+            async with model_sem:
+                model_call = await model_provider.call(prompt=prompt, image_data_url=image_data_url)
 
-        model_text = extract_text_from_provider_response(model_provider.cfg.provider, (model_call or {}).get("response"))
-        model_call_log = _sanitize_call_for_logging(model_provider.cfg.provider, model_call, image_path)
+            model_text = extract_text_from_provider_response(
+                model_provider.cfg.provider, (model_call or {}).get("response")
+            )
+            model_call_log = _sanitize_call_for_logging(model_provider.cfg.provider, model_call, image_path)
 
-        answer_obj, answer_parse_error = parse_answer_json(model_text, mcq=mcq)
+            answer_obj, answer_parse_error = parse_answer_json(model_text, mcq=mcq)
+            if answer_obj is not None:
+                answer_parse_error = None
+                break
+
+        t1 = now_ms()
+        extracted: Optional[str] = None
         if answer_obj is not None:
-            answer_parse_error = None
+            extracted = str(answer_obj.get("answer", "")).strip()
+        return {
+            "answer": extracted,
+            "answer_json_ok": (answer_obj is not None),
+            "answer_json_attempts": answer_attempts,
+            "answer_json_error": answer_parse_error,
+            "model_text": model_text,
+            "model_call_log": model_call_log,
+            "model_latency_ms": (t1 - t0),
+        }
+
+    # ---- Answering model: majority vote over N attempts (N>=1) ----
+    vote_n = max(1, int(getattr(run_cfg, "majority_vote", 1) or 1))
+    t0 = now_ms()
+    vote_runs: List[Dict[str, Any]] = []
+    for _ in range(vote_n):
+        if run_cfg.cancel_event is not None and run_cfg.cancel_event.is_set():
             break
+        vote_runs.append(await _answer_once())
     t1 = now_ms()
 
-    extracted_final_answer: Optional[str] = None
-    if answer_obj is not None:
-        extracted_final_answer = str(answer_obj.get("answer", "")).strip()
+    vote_answers = [r.get("answer") for r in vote_runs if r.get("answer")]
+    extracted_final_answer: Optional[str] = majority_vote_pick([str(x) for x in vote_answers])
+
+    # Winner for logging: first run that matches the final answer, else first run.
+    winner = None
+    for r in vote_runs:
+        if extracted_final_answer and (r.get("answer") == extracted_final_answer):
+            winner = r
+            break
+    if winner is None and vote_runs:
+        winner = vote_runs[0]
+
+    model_text = (winner.get("model_text") if isinstance(winner, dict) else "") or ""
+    model_call_log = (winner.get("model_call_log") if isinstance(winner, dict) else None)
+    answer_json_ok = bool(winner.get("answer_json_ok")) if isinstance(winner, dict) else False
+    answer_attempts = int(winner.get("answer_json_attempts") or 0) if isinstance(winner, dict) else 0
+    answer_parse_error = winner.get("answer_json_error") if isinstance(winner, dict) else None
     rule_correct = None
     judge_call = None
     judge_block = None
@@ -1018,9 +1094,11 @@ async def eval_one(
         # Canonical prediction is extracted from answering-model JSON (NOT judge extraction).
         "pred_raw": extracted_final_answer,
         "pred": extracted_final_answer,
-        "answer_json_ok": (answer_obj is not None),
+        "answer_json_ok": answer_json_ok,
         "answer_json_attempts": answer_attempts,
         "answer_json_error": answer_parse_error,
+        "majority_vote_n": vote_n,
+        "majority_vote_answers": vote_answers,
         "rule_correct": rule_correct,
         "judge_correct": judge_correct,
         "latency_ms": t1 - t0,
@@ -1092,8 +1170,8 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
 
     total_questions = len(rows)
     print(
-        f"Total questions: {total_questions} | model_concurrency={run_cfg.model_concurrency} | judge_concurrency={run_cfg.judge_concurrency} | vpn={run_cfg.vpn} | cot={run_cfg.cot}",
-        flush=True
+        f"Total questions: {total_questions} | model_concurrency={run_cfg.model_concurrency} | judge_concurrency={run_cfg.judge_concurrency} | vpn={run_cfg.vpn} | cot={run_cfg.cot} | majority_vote={run_cfg.majority_vote}",
+        flush=True,
     )
 
     model_sem = asyncio.Semaphore(run_cfg.model_concurrency)
@@ -1329,6 +1407,13 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
         help="Max attempts to re-ask answering model when JSON parsing fails (content-level retries). Default: 3",
     )
 
+    ap.add_argument(
+        "--majority-vote",
+        type=int,
+        default=None,
+        help="Call answering model N times per question and take majority answer (default: 1).",
+    )
+
     # VPN/proxy switch
     ap.add_argument("--vpn", type=str, choices=["on", "off"], default=None,
                     help="VPN mode switch: on=use proxy, off=direct")
@@ -1473,6 +1558,11 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
             args.answer_json_max_attempts
             if args.answer_json_max_attempts is not None
             else cfg.get("answer_json_max_attempts", 3)
+        ),
+        majority_vote=int(
+            args.majority_vote
+            if args.majority_vote is not None
+            else cfg.get("majority_vote", 1)
         ),
         vpn=(args.vpn if args.vpn is not None else cfg.get("vpn", "off")),
         proxy=args.proxy or cfg.get("proxy", ""),
