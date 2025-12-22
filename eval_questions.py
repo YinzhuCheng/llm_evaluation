@@ -555,25 +555,6 @@ class LLMProvider:
         else:
             raise ValueError(f"Unknown provider: {self.cfg.provider}")
 
-
-def normalize_api_protocol(name: str) -> str:
-    """
-    Normalize user-facing protocol names to internal provider ids.
-    Supported (case-insensitive):
-    - OpenAI -> openai
-    - Anthropic -> claude
-    - Google -> gemini
-    Also accepts legacy ids: openai/claude/gemini
-    """
-    s = (name or "").strip().lower()
-    if s in {"openai"}:
-        return "openai"
-    if s in {"anthropic", "claude"}:
-        return "claude"
-    if s in {"google", "gemini"}:
-        return "gemini"
-    return s
-
     async def _call_openai_chat_completions(self, prompt: str, image_data_url: Optional[str]) -> Dict[str, Any]:
         url = self.cfg.base_url.rstrip("/") + "/v1/chat/completions"
         headers = {"Authorization": f"Bearer {self.cfg.api_key}"}
@@ -688,6 +669,25 @@ def normalize_api_protocol(name: str) -> str:
             return resp.json()
         except Exception:
             return {"raw_text": resp.text}
+
+
+def normalize_api_protocol(name: str) -> str:
+    """
+    Normalize user-facing protocol names to internal provider ids.
+    Supported (case-insensitive):
+    - OpenAI -> openai
+    - Anthropic -> claude
+    - Google -> gemini
+    Also accepts legacy ids: openai/claude/gemini
+    """
+    s = (name or "").strip().lower()
+    if s in {"openai"}:
+        return "openai"
+    if s in {"anthropic", "claude"}:
+        return "claude"
+    if s in {"google", "gemini"}:
+        return "gemini"
+    return s
 
 
 def extract_text_from_provider_response(provider: str, resp_json: Any) -> str:
