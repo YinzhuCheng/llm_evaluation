@@ -1135,134 +1135,210 @@ async def eval_one(
             "model_latency_ms": (t1 - t0),
         }
 
-    # ---- Answering model: majority vote over N attempts (N>=1) ----
+    # ---- Majority vote execution model (requested):
+    # If majority_vote=N, run the "vote=1" path sequentially N times.
+    # - Rounds 1..N-1: answering model only; judge fields are empty; print immediately.
+    # - Round N: compute final pred from ALL answers so far, then call judge ONCE; print final with judge.
     vote_n = max(1, int(getattr(run_cfg, "majority_vote", 1) or 1))
-    t0 = now_ms()
     vote_runs: List[Dict[str, Any]] = []
-    for _ in range(vote_n):
+    vote_answers: List[str] = []
+    vote_t0 = now_ms()
+
+    def _preview(s: str) -> str:
+        s2 = (s or "").replace("\n", " ").strip()
+        return (s2[:200] + "...") if len(s2) > 200 else s2
+
+    final_out: Optional[Dict[str, Any]] = None
+
+    for round_idx in range(1, vote_n + 1):
         if run_cfg.cancel_event is not None and run_cfg.cancel_event.is_set():
-            break
-        vote_runs.append(await _answer_once())
-    t1 = now_ms()
+            cancelled_out = {
+                "id": qid,
+                "idx": idx,
+                "total": total,
+                "skipped": True,
+                "skip_reason": "cancelled",
+                "gold_raw": gold_raw,
+                "gold": gold_norm,
+                "pred_raw": None,
+                "pred": None,
+                "answer_json_ok": False,
+                "answer_json_attempts": 0,
+                "answer_json_error": "cancelled",
+                "majority_vote_n": vote_n,
+                "majority_vote_round": round_idx,
+                "majority_vote_is_final": False,
+                "majority_vote_answers": vote_answers,
+                "rule_correct": None,
+                "judge_correct": None,
+                "latency_ms": 0,
+                "judge_latency_ms": None,
+                "total_latency_ms": 0,
+                "question": question,
+                "options": options,
+                "question_type_raw": question_type_raw,
+                "question_type_inferred": "Multiple Choice" if mcq else "Freeform",
+                "image_path": image_path,
+                "image_data_url": image_path if image_path else None,
+                "cot": run_cfg.cot,
+                "model_call": None,
+                "model_text": "",
+                "judge": None,
+                "judge_call": None,
+            }
+            async with write_lock:
+                safe_jsonl_append(results_path, cancelled_out)
+            print(f"[{idx}/{total}] id={qid}  CANCELLED  round={round_idx}/{vote_n}", flush=True)
+            return cancelled_out
 
-    vote_answers = [r.get("answer") for r in vote_runs if r.get("answer")]
-    extracted_final_answer: Optional[str] = majority_vote_pick([str(x) for x in vote_answers])
+        one = await _answer_once()
+        vote_runs.append(one)
+        if one.get("answer"):
+            vote_answers.append(str(one.get("answer")))
 
-    # Winner for logging: first run that matches the final answer, else first run.
-    winner = None
-    for r in vote_runs:
-        if extracted_final_answer and (r.get("answer") == extracted_final_answer):
-            winner = r
-            break
-    if winner is None and vote_runs:
-        winner = vote_runs[0]
+        # Rounds 1..N-1: print and log immediately with empty judge.
+        if round_idx < vote_n:
+            out_round = {
+                "id": qid,
+                "idx": idx,
+                "total": total,
+                "skipped": False,
+                "skip_reason": None,
+                "gold_raw": gold_raw,
+                "gold": gold_norm,
+                "pred_raw": one.get("answer"),
+                "pred": one.get("answer"),
+                "answer_json_ok": bool(one.get("answer_json_ok")),
+                "answer_json_attempts": int(one.get("answer_json_attempts") or 0),
+                "answer_json_error": one.get("answer_json_error"),
+                "majority_vote_n": vote_n,
+                "majority_vote_round": round_idx,
+                "majority_vote_is_final": False,
+                "majority_vote_answers": list(vote_answers),
+                "rule_correct": None,
+                "judge_correct": None,
+                "latency_ms": int(one.get("model_latency_ms") or 0),
+                "judge_latency_ms": None,
+                "total_latency_ms": int(one.get("model_latency_ms") or 0),
+                "question": question,
+                "options": options,
+                "question_type_raw": question_type_raw,
+                "question_type_inferred": "Multiple Choice" if mcq else "Freeform",
+                "image_path": image_path,
+                "image_data_url": image_path if image_path else None,
+                "cot": run_cfg.cot,
+                "model_call": one.get("model_call_log"),
+                "model_text": (one.get("model_text") or ""),
+                "judge": None,
+                "judge_call": None,
+            }
+            async with write_lock:
+                safe_jsonl_append(results_path, out_round)
+            print(
+                f"[{idx}/{total}] id={qid}  ROUND {round_idx}/{vote_n}  mcq={mcq}  gold={gold_norm}  pred={out_round.get('pred')}  judge_correct=  model_ms={out_round.get('latency_ms')}",
+                flush=True,
+            )
+            print(f"   model_text: {_preview(out_round.get('model_text') or '')}", flush=True)
+            print("   judge_text: ", flush=True)
+            continue
 
-    model_text = (winner.get("model_text") if isinstance(winner, dict) else "") or ""
-    model_call_log = (winner.get("model_call_log") if isinstance(winner, dict) else None)
-    answer_json_ok = bool(winner.get("answer_json_ok")) if isinstance(winner, dict) else False
-    answer_attempts = int(winner.get("answer_json_attempts") or 0) if isinstance(winner, dict) else 0
-    answer_parse_error = winner.get("answer_json_error") if isinstance(winner, dict) else None
-    rule_correct = None
-    judge_call = None
-    judge_block = None
-    judge_correct = None
-    judge_call_log = None
+        # Round N: compute final answer from ALL collected answers, then call judge ONCE.
+        extracted_final_answer: Optional[str] = majority_vote_pick([str(x) for x in vote_answers if str(x).strip()])
+        judge_block = None
+        judge_correct: Optional[bool] = None
+        judge_call_log = None
+        judge_latency_ms: Optional[int] = None
 
-    # ALWAYS use judge model for scoring (all question types), but send only minimal content.
-    # - MCQ: send gold + extracted answer ONLY (no question/options)
-    # - Freeform: send question + gold + extracted answer, and strip base64 blobs
-    if judge_provider is not None and extracted_final_answer is not None:
-        if mcq:
-            judge_prompt = build_mcq_judge_prompt_minimal(extracted_final_answer, gold_norm)
+        if judge_provider is not None and extracted_final_answer is not None:
+            if mcq:
+                judge_prompt = build_mcq_judge_prompt_minimal(extracted_final_answer, gold_norm)
+            else:
+                q_clean = strip_base64_payloads(question)
+                gold_clean = strip_base64_payloads(gold_raw)
+                ans_clean = strip_base64_payloads(extracted_final_answer)
+                judge_prompt = build_freeform_judge_prompt(q_clean, ans_clean, gold_clean)
+
+            async with judge_sem:
+                jt0 = now_ms()
+                judge_call = await judge_provider.call(prompt=judge_prompt, image_data_url=None)
+                jt1 = now_ms()
+
+            judge_latency_ms = jt1 - jt0
+            judge_text = extract_text_from_provider_response(judge_provider.cfg.provider, (judge_call or {}).get("response"))
+            judge_call_log = _sanitize_call_for_logging(judge_provider.cfg.provider, judge_call, image_path=None)
+            judge_json = parse_judge_json(judge_text)
+            verdict = str(judge_json.get("verdict", "unjudgeable")).lower()
+            judge_correct = (verdict == "correct")
+
+            extracted = judge_json.get("extracted_answer", None)
+            extracted_norm = normalize_csv_letters(extracted) if isinstance(extracted, str) else ""
+            judge_json["extracted_answer_normalized"] = extracted_norm
+
+            judge_block = {
+                "judge_text": judge_text,
+                "judge_json": judge_json,
+                "judge_latency_ms": judge_latency_ms,
+            }
         else:
-            q_clean = strip_base64_payloads(question)
-            gold_clean = strip_base64_payloads(gold_raw)
-            ans_clean = strip_base64_payloads(extracted_final_answer)
-            judge_prompt = build_freeform_judge_prompt(q_clean, ans_clean, gold_clean)
+            # No judge result (e.g., answering JSON failed) => count as incorrect.
+            judge_correct = False
 
-        async with judge_sem:
-            jt0 = now_ms()
-            # IMPORTANT: do NOT send image/base64 to judge
-            judge_call = await judge_provider.call(prompt=judge_prompt, image_data_url=None)
-            jt1 = now_ms()
+        vote_t1 = now_ms()
+        model_wall_ms = vote_t1 - vote_t0
+        total_ms = model_wall_ms + (judge_latency_ms or 0)
 
-        judge_text = extract_text_from_provider_response(judge_provider.cfg.provider, (judge_call or {}).get("response"))
-        judge_call_log = _sanitize_call_for_logging(judge_provider.cfg.provider, judge_call, image_path=None)
-        judge_json = parse_judge_json(judge_text)
-        verdict = str(judge_json.get("verdict", "unjudgeable")).lower()
-        # Metric policy: unjudgeable counts as incorrect.
-        judge_correct = (verdict == "correct")
-
-        extracted = judge_json.get("extracted_answer", None)
-        extracted_norm = normalize_csv_letters(extracted) if isinstance(extracted, str) else ""
-        judge_json["extracted_answer_normalized"] = extracted_norm
-
-        judge_block = {
-            "judge_text": judge_text,
-            "judge_json": judge_json,
-            "judge_latency_ms": jt1 - jt0,
+        final_out = {
+            "id": qid,
+            "idx": idx,
+            "total": total,
+            "skipped": False,
+            "skip_reason": None,
+            "gold_raw": gold_raw,
+            "gold": gold_norm,
+            # Final pred is determined after collecting ALL N answers.
+            "pred_raw": extracted_final_answer,
+            "pred": extracted_final_answer,
+            "answer_json_ok": bool(one.get("answer_json_ok")),
+            "answer_json_attempts": int(one.get("answer_json_attempts") or 0),
+            "answer_json_error": one.get("answer_json_error"),
+            "majority_vote_n": vote_n,
+            "majority_vote_round": round_idx,
+            "majority_vote_is_final": True,
+            "majority_vote_answers": list(vote_answers),
+            "rule_correct": None,
+            "judge_correct": judge_correct,
+            # Keep similar meaning as before: model wall time across the whole vote loop.
+            "latency_ms": model_wall_ms,
+            "judge_latency_ms": judge_latency_ms,
+            "total_latency_ms": total_ms,
+            "question": question,
+            "options": options,
+            "question_type_raw": question_type_raw,
+            "question_type_inferred": "Multiple Choice" if mcq else "Freeform",
+            "image_path": image_path,
+            "image_data_url": image_path if image_path else None,
+            "cot": run_cfg.cot,
+            # For this round's "vote=1 style" visibility, keep the last round's call/text.
+            "model_call": one.get("model_call_log"),
+            "model_text": (one.get("model_text") or ""),
+            "judge": judge_block,
+            "judge_call": judge_call_log,
         }
-    else:
-        # No judge result (e.g., answering JSON failed) => count as incorrect.
-        judge_correct = False
 
-    out = {
-        "id": qid,
-        "idx": idx,
-        "total": total,
-        "skipped": False,
-        "skip_reason": None,
-        "gold_raw": gold_raw,
-        "gold": gold_norm,
-        # Canonical prediction is extracted from answering-model JSON (NOT judge extraction).
-        "pred_raw": extracted_final_answer,
-        "pred": extracted_final_answer,
-        "answer_json_ok": answer_json_ok,
-        "answer_json_attempts": answer_attempts,
-        "answer_json_error": answer_parse_error,
-        "majority_vote_n": vote_n,
-        "majority_vote_answers": vote_answers,
-        "rule_correct": rule_correct,
-        "judge_correct": judge_correct,
-        "latency_ms": t1 - t0,
-        "judge_latency_ms": (judge_block.get("judge_latency_ms") if isinstance(judge_block, dict) else None),
-        "total_latency_ms": (t1 - t0) + (judge_block.get("judge_latency_ms") if isinstance(judge_block, dict) and isinstance(judge_block.get("judge_latency_ms"), int) else 0),
-        "question": question,
-        "options": options,
-        "question_type_raw": question_type_raw,
-        "question_type_inferred": "Multiple Choice" if mcq else "Freeform",
-        "image_path": image_path,
-        # Keep a compact image reference; do NOT log base64.
-        "image_data_url": image_path if image_path else None,
-        "cot": run_cfg.cot,
-        # FULL ARCHIVE:
-        "model_call": model_call_log,
-        "model_text": model_text,
-        "judge": judge_block,
-        "judge_call": judge_call_log,
-    }
+        async with write_lock:
+            safe_jsonl_append(results_path, final_out)
 
-    # IMPORTANT: Always append to the single shared results_path computed in run_eval().
-    async with write_lock:
-        safe_jsonl_append(results_path, out)
+        print(
+            f"[{idx}/{total}] id={qid}  FINAL {round_idx}/{vote_n}  mcq={mcq}  gold={gold_norm}  pred={extracted_final_answer}  judge_correct={judge_correct}  model_ms={model_wall_ms}  judge_ms={(judge_latency_ms or 0)}  total_ms={total_ms}",
+            flush=True,
+        )
+        print(f"   model_text: {_preview(final_out.get('model_text') or '')}", flush=True)
+        jtxt = (judge_block.get("judge_text") if isinstance(judge_block, dict) else "") or ""
+        print(f"   judge_text: {_preview(jtxt)}", flush=True)
+        break
 
-    # Print ONLY after both model + judge have completed for this question.
-    # (Per user request: do not print immediately after model finishes.)
-    model_preview = (model_text or "").replace("\n", " ").strip()
-    if len(model_preview) > 200:
-        model_preview = model_preview[:200] + "..."
-    jtxt = (judge_block.get("judge_text") if isinstance(judge_block, dict) else "") or ""
-    judge_preview = jtxt.replace("\n", " ").strip()
-    if len(judge_preview) > 200:
-        judge_preview = judge_preview[:200] + "..."
-
-    print(
-        f"[{idx}/{total}] id={qid}  DONE  mcq={mcq}  gold={gold_norm}  pred={extracted_final_answer}  judge_correct={judge_correct}  model_ms={t1 - t0}  judge_ms={(out.get('judge_latency_ms') or 0)}  total_ms={out.get('total_latency_ms')}",
-        flush=True
-    )
-    print(f"   model_text: {model_preview}", flush=True)
-    print(f"   judge_text: {judge_preview}", flush=True)
-    return out
+    assert final_out is not None
+    return final_out
 
 
 
