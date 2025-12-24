@@ -1041,8 +1041,26 @@ async def eval_one(
         except Exception:
             multi_answer = None
 
-    img_cell = row.get("Image", None)
-    img_dep = int(row.get("Image_Dependency", 0) or 0)
+    def _pick_image_cell(r: Dict[str, Any]) -> Any:
+        # Dataset may provide multiple image columns, e.g. Image / Image.1.
+        for k in ("Image", "Image.1", "Image_1", "Image2", "Image_2"):
+            v = r.get(k, None)
+            if v is None or is_nan(v):
+                continue
+            s = str(v).strip()
+            if s and s.lower() != "nan":
+                return v
+        return r.get("Image", None)
+
+    img_cell = _pick_image_cell(row)
+    # Image_Dependency: supports 0/1/2
+    # - 0: no image dependency (or no image)
+    # - 1: image may help, but do not skip if missing
+    # - 2: image is required; skip if missing
+    try:
+        img_dep = int(row.get("Image_Dependency", 0) or 0)
+    except Exception:
+        img_dep = 0
 
     cot_on = (run_cfg.cot == "on")
 
@@ -1053,8 +1071,8 @@ async def eval_one(
     if image_path and os.path.exists(image_path):
         image_data_url = image_file_to_data_url(image_path)
 
-    # Skip if image required but missing
-    if img_dep == 1 and not image_data_url and run_cfg.skip_image_missing:
+    # Skip if image required but missing (dependency level 2)
+    if img_dep >= 2 and not image_data_url and run_cfg.skip_image_missing:
         img_preview = ""
         if img_cell is not None and not is_nan(img_cell):
             img_preview = str(img_cell).strip()
@@ -1513,6 +1531,8 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     }
     if "Image_Dependency" in cols:
         breakdowns["by_image_dependency"] = _group_breakdown(metric_rows, "Image_Dependency")
+    if "Image_Complexity" in cols:
+        breakdowns["by_image_complexity"] = _group_breakdown(metric_rows, "Image_Complexity")
     if "Subfield" in cols:
         breakdowns["by_subfield"] = _group_breakdown(metric_rows, "Subfield")
     if "Academic_Level" in cols:
@@ -1617,6 +1637,8 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     print("\n=== Scores ===", flush=True)
     print(f"Overall (accuracy): {overall.get('accuracy_str')}", flush=True)
     # Requested prints
+    if isinstance(breakdowns.get("by_image_complexity"), dict):
+        _print_breakdown("Image_Complexity", breakdowns["by_image_complexity"])
     if isinstance(breakdowns.get("by_subfield"), dict):
         _print_breakdown("Subfield", breakdowns["by_subfield"])
     if isinstance(breakdowns.get("by_academic_level"), dict):
