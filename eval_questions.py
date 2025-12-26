@@ -301,6 +301,43 @@ def extract_first_json_object(s: str) -> Optional[str]:
     return None
 
 
+def extract_first_json_object_strict(s: str) -> Optional[str]:
+    """
+    Streaming extraction of the first JSON object from text.
+    More robust than using rfind('}') when extra text follows JSON.
+    """
+    if not s:
+        return None
+    candidate = _strip_markdown_code_fences(str(s)).strip()
+    start = candidate.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(candidate)):
+        ch = candidate[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return candidate[start : i + 1].strip()
+    return None
+
+
 def parse_answer_json(text: str, *, mcq: bool) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Parse answering-model output as a strict JSON object.
@@ -309,7 +346,7 @@ def parse_answer_json(text: str, *, mcq: bool) -> Tuple[Optional[Dict[str, Any]]
     - Freeform: answer can be string/number/boolean/list[string] (cast to string; list joined by newlines)
     """
     raw = (text or "").strip()
-    candidate = extract_first_json_object(raw)
+    candidate = extract_first_json_object_strict(raw) or extract_first_json_object(raw)
     if not candidate:
         return None, "no_json_object_found"
     try:
@@ -388,7 +425,7 @@ def _sanitize_call_for_logging(provider: str, call_obj: Optional[Dict[str, Any]]
     req2 = dict(req)
 
     try:
-        if p == "openai":
+        if p in {"openai", "openrouter"}:
             # messages: [{role, content}, ...]
             messages = req2.get("messages")
             if isinstance(messages, list):
@@ -475,6 +512,36 @@ def _sanitize_call_for_logging(provider: str, call_obj: Optional[Dict[str, Any]]
         pass
 
     out["request"] = req2
+
+    # Also sanitize RESPONSE (best-effort) to avoid huge unreadable blobs in jsonl logs
+    try:
+        resp = out.get("response")
+        if isinstance(resp, dict):
+            # deep-ish copy via JSON (safe for plain dict/list scalars)
+            resp2 = json.loads(json.dumps(resp))
+            choices = resp2.get("choices")
+            if isinstance(choices, list):
+                for ch in choices:
+                    if not isinstance(ch, dict):
+                        continue
+                    msg = ch.get("message")
+                    if isinstance(msg, dict):
+                        rd = msg.get("reasoning_details")
+                        if isinstance(rd, list):
+                            new_rd = []
+                            for it in rd:
+                                if isinstance(it, dict) and it.get("type") == "reasoning.encrypted":
+                                    it2 = dict(it)
+                                    it2["data"] = "<omitted>"
+                                    new_rd.append(it2)
+                                else:
+                                    new_rd.append(it)
+                            msg["reasoning_details"] = new_rd
+                        if isinstance(msg.get("reasoning"), str):
+                            msg["reasoning"] = strip_base64_payloads(msg.get("reasoning"))
+            out["response"] = resp2
+    except Exception:
+        pass
     return out
 
 
@@ -898,7 +965,7 @@ def extract_text_from_provider_response(provider: str, resp_json: Any) -> str:
         return ""
     p = provider.lower()
     try:
-        if p == "openai":
+        if p in {"openai", "openrouter"}:
             choices = resp_json.get("choices", [])
             if not choices:
                 return ""
@@ -1127,16 +1194,10 @@ def parse_judge_json(text: str) -> Dict[str, Any]:
     """
     text = (text or "").strip()
     try:
-        # Best-effort: some models may wrap JSON with extra text/codefences.
-        candidate = text
-        if "```" in candidate:
-            candidate = re.sub(r"(?s)^```(?:json)?\s*|\s*```$", "", candidate.strip()).strip()
-        if not candidate.startswith("{"):
-            start = candidate.find("{")
-            end = candidate.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                candidate = candidate[start : end + 1]
-
+        # Best-effort: judge may include extra text after JSON; extract the first JSON object.
+        candidate = extract_first_json_object_strict(text) or extract_first_json_object(text)
+        if not candidate:
+            raise ValueError("no_json_object_found")
         judge_json = json.loads(candidate)
 
         # 解析 "verdict" 字段
