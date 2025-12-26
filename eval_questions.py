@@ -1342,6 +1342,31 @@ async def eval_one(
         if one.get("answer"):
             vote_answers.append(str(one.get("answer")))
 
+        def _judge_detail(jb: Any) -> str:
+            try:
+                if not isinstance(jb, dict):
+                    return ""
+                jj = jb.get("judge_json")
+                if not isinstance(jj, dict):
+                    return ""
+                verdict = str(jj.get("verdict", "") or "").strip()
+                extracted_norm = str(jj.get("extracted_answer_normalized", "") or "").strip()
+                extracted_raw = jj.get("extracted_answer", None)
+                extracted_raw_s = str(extracted_raw).strip() if isinstance(extracted_raw, str) else ""
+                reason = str(jj.get("reason", "") or "").strip()
+                parts: List[str] = []
+                if verdict:
+                    parts.append(f"verdict={verdict}")
+                if extracted_norm:
+                    parts.append(f"extracted_norm={extracted_norm}")
+                elif extracted_raw_s:
+                    parts.append(f"extracted={extracted_raw_s}")
+                if reason:
+                    parts.append(f"reason={_preview(reason)}")
+                return "  ".join(parts)
+            except Exception:
+                return ""
+
         # Rounds 1..N-1: print and log immediately with empty judge.
         if round_idx < vote_n:
             out_round = {
@@ -1381,11 +1406,12 @@ async def eval_one(
             async with write_lock:
                 safe_jsonl_append(results_path, out_round)
             print(
-                f"[{idx}/{total}] id={qid}  ROUND {round_idx}/{vote_n}  mcq={mcq}  gold={gold_norm}  pred={out_round.get('pred')}  judge_correct=  model_ms={out_round.get('latency_ms')}",
+                f"[{idx}/{total}] id={qid}  ROUND {round_idx}/{vote_n}  mcq={mcq}  gold={gold_norm}  pred={out_round.get('pred')}  judge_correct=  model_ms={out_round.get('latency_ms')}  answers_so_far={vote_answers}",
                 flush=True,
             )
             print(f"   model_text: {_preview(out_round.get('model_text') or '')}", flush=True)
             print("   judge_text: ", flush=True)
+            print("   judge_detail: ", flush=True)
             continue
 
         # Round N: compute final answer from ALL collected answers, then call judge ONCE.
@@ -1481,6 +1507,7 @@ async def eval_one(
         print(f"   model_text: {_preview(final_out.get('model_text') or '')}", flush=True)
         jtxt = (judge_block.get("judge_text") if isinstance(judge_block, dict) else "") or ""
         print(f"   judge_text: {_preview(jtxt)}", flush=True)
+        print(f"   judge_detail: {_judge_detail(judge_block)}", flush=True)
         break
 
     assert final_out is not None
