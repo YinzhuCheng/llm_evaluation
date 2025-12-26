@@ -524,10 +524,12 @@ class RunConfig:
     # NEW: reasoning effort (OpenRouter)
     # - off => do not send the parameter
     # - otherwise send reasoning.effort in the request
-    reasoning_effort: str = "off"  # off/xhigh/high/medium/low/minimal/none
+    model_reasoning_effort: str = "off"  # off/xhigh/high/medium/low/minimal/none
+    judge_reasoning_effort: str = "off"  # off/xhigh/high/medium/low/minimal/none
 
-    # OpenRouter cost tracking (best-effort)
-    cost_total_usd: float = 0.0
+    # OpenRouter cost tracking (best-effort, USD)
+    cost_total_usd_model: float = 0.0
+    cost_total_usd_judge: float = 0.0
 
     # vpn/proxy switch
     vpn: str = "off"       # on/off
@@ -602,12 +604,22 @@ class LLMProvider:
         self.cfg = cfg
         self.run_cfg = run_cfg
 
-    async def call(self, prompt: str, image_data_url: Optional[str] = None, *, label: str = "") -> Dict[str, Any]:
+    async def call(
+        self,
+        prompt: str,
+        image_data_url: Optional[str] = None,
+        *,
+        label: str = "",
+        role: str = "other",  # model|judge|other (used for cost buckets)
+        reasoning_effort: str = "off",
+    ) -> Dict[str, Any]:
         if self.run_cfg.cancel_event is not None and self.run_cfg.cancel_event.is_set():
             return {"request": None, "response": None, "error": "cancelled", "attempts": 0, "status": None}
         p = self.cfg.provider.lower()
         if p in {"openai", "openrouter"}:
-            return await self._call_openai_chat_completions(prompt, image_data_url, label=label)
+            return await self._call_openai_chat_completions(
+                prompt, image_data_url, label=label, role=role, reasoning_effort=reasoning_effort
+            )
         elif p == "gemini":
             return await self._call_gemini(prompt, image_data_url)
         elif p == "claude":
@@ -615,7 +627,15 @@ class LLMProvider:
         else:
             raise ValueError(f"Unknown provider: {self.cfg.provider}")
 
-    async def _call_openai_chat_completions(self, prompt: str, image_data_url: Optional[str], *, label: str = "") -> Dict[str, Any]:
+    async def _call_openai_chat_completions(
+        self,
+        prompt: str,
+        image_data_url: Optional[str],
+        *,
+        label: str = "",
+        role: str = "other",
+        reasoning_effort: str = "off",
+    ) -> Dict[str, Any]:
         url = self.cfg.base_url.rstrip("/") + "/v1/chat/completions"
         headers = {"Authorization": f"Bearer {self.cfg.api_key}"}
         p = (self.cfg.provider or "").lower()
@@ -645,7 +665,7 @@ class LLMProvider:
 
         # OpenRouter: optional reasoning effort + require_parameters guard.
         if p == "openrouter":
-            eff = (getattr(self.run_cfg, "reasoning_effort", "off") or "off").strip().lower()
+            eff = (reasoning_effort or "off").strip().lower()
             if eff and eff != "off":
                 payload["reasoning"] = {"effort": eff}
                 payload["provider"] = {"require_parameters": True}
@@ -658,7 +678,8 @@ class LLMProvider:
             )
             # Best-effort: OpenRouter cost query + fatal parameter guard
             cost_usd: Optional[float] = None
-            cost_total_usd: Optional[float] = None
+            cost_total_usd_model: Optional[float] = None
+            cost_total_usd_judge: Optional[float] = None
             if p == "openrouter" and resp is not None:
                 try:
                     # If require_parameters fails, OpenRouter should respond with a 4xx + error JSON.
@@ -680,7 +701,7 @@ class LLMProvider:
                             )
                             raise RuntimeError(
                                 "OpenRouter rejected reasoning.effort with provider.require_parameters=true. "
-                                "Disable --reasoning-effort (set to off) and re-run. "
+                                "Disable reasoning effort (set to off) and re-run. "
                                 f"Details: {msg}"
                             )
                 except Exception:
@@ -699,10 +720,12 @@ class LLMProvider:
                         )
                         if isinstance(cost_usd, (int, float)):
                             # Best-effort: simple sum; concurrency ordering not guaranteed (acceptable per requirement).
-                            self.run_cfg.cost_total_usd = float(getattr(self.run_cfg, "cost_total_usd", 0.0) or 0.0) + float(cost_usd)
-                            cost_total_usd = float(self.run_cfg.cost_total_usd)
-                            tag = label or "call"
-                            print(f"[OPENROUTER COST] {tag}  cost_usd={cost_usd:.6f}  total_usd={cost_total_usd:.6f}", flush=True)
+                            if role == "model":
+                                self.run_cfg.cost_total_usd_model = float(getattr(self.run_cfg, "cost_total_usd_model", 0.0) or 0.0) + float(cost_usd)
+                            elif role == "judge":
+                                self.run_cfg.cost_total_usd_judge = float(getattr(self.run_cfg, "cost_total_usd_judge", 0.0) or 0.0) + float(cost_usd)
+                            cost_total_usd_model = float(getattr(self.run_cfg, "cost_total_usd_model", 0.0) or 0.0)
+                            cost_total_usd_judge = float(getattr(self.run_cfg, "cost_total_usd_judge", 0.0) or 0.0)
                 except Exception:
                     pass
         return {
@@ -712,7 +735,8 @@ class LLMProvider:
             "attempts": attempts,
             "status": getattr(resp, "status_code", None),
             "cost_usd": cost_usd,
-            "cost_total_usd": cost_total_usd,
+            "cost_total_usd_model": cost_total_usd_model,
+            "cost_total_usd_judge": cost_total_usd_judge,
         }
 
     async def _call_gemini(self, prompt: str, image_data_url: Optional[str]) -> Dict[str, Any]:
@@ -1255,7 +1279,13 @@ async def eval_one(
                 prompt = build_answer_json_retry_prefix(k + 1, answer_parse_error or "unknown") + base_prompt
 
             async with model_sem:
-                model_call = await model_provider.call(prompt=prompt, image_data_url=image_data_url, label=f"model id={qid} idx={idx}")
+                model_call = await model_provider.call(
+                    prompt=prompt,
+                    image_data_url=image_data_url,
+                    label=f"model id={qid} idx={idx}",
+                    role="model",
+                    reasoning_effort=getattr(run_cfg, "model_reasoning_effort", "off"),
+                )
 
             model_text = extract_text_from_provider_response(
                 model_provider.cfg.provider, (model_call or {}).get("response")
@@ -1405,8 +1435,16 @@ async def eval_one(
             }
             async with write_lock:
                 safe_jsonl_append(results_path, out_round)
+            # Cost info (OpenRouter only; USD). Accumulators are stored in run_cfg.
+            mc = out_round.get("model_call") if isinstance(out_round, dict) else None
+            m_cost = mc.get("cost_usd") if isinstance(mc, dict) else None
+            m_total = float(getattr(run_cfg, "cost_total_usd_model", 0.0) or 0.0)
+            j_total = float(getattr(run_cfg, "cost_total_usd_judge", 0.0) or 0.0)
+            cost_part = ""
+            if isinstance(m_cost, (int, float)):
+                cost_part = f"  model_cost_usd={float(m_cost):.6f}  totals_usd(model={m_total:.6f},judge={j_total:.6f})"
             print(
-                f"[{idx}/{total}] id={qid}  ROUND {round_idx}/{vote_n}  mcq={mcq}  gold={gold_norm}  pred={out_round.get('pred')}  judge_correct=  model_ms={out_round.get('latency_ms')}  answers_so_far={vote_answers}",
+                f"[{idx}/{total}] id={qid}  ROUND {round_idx}/{vote_n}  mcq={mcq}  gold={gold_norm}  pred={out_round.get('pred')}  judge_correct=  model_ms={out_round.get('latency_ms')}  answers_so_far={vote_answers}{cost_part}",
                 flush=True,
             )
             print(f"   model_text: {_preview(out_round.get('model_text') or '')}", flush=True)
@@ -1432,7 +1470,13 @@ async def eval_one(
 
             async with judge_sem:
                 jt0 = now_ms()
-                judge_call = await judge_provider.call(prompt=judge_prompt, image_data_url=None, label=f"judge id={qid} idx={idx}")
+                judge_call = await judge_provider.call(
+                    prompt=judge_prompt,
+                    image_data_url=None,
+                    label=f"judge id={qid} idx={idx}",
+                    role="judge",
+                    reasoning_effort=getattr(run_cfg, "judge_reasoning_effort", "off"),
+                )
                 jt1 = now_ms()
 
             judge_latency_ms = jt1 - jt0
@@ -1500,8 +1544,21 @@ async def eval_one(
         async with write_lock:
             safe_jsonl_append(results_path, final_out)
 
+        # Cost info (OpenRouter only; USD). Accumulators are stored in run_cfg.
+        m_call = final_out.get("model_call") if isinstance(final_out, dict) else None
+        j_call = final_out.get("judge_call") if isinstance(final_out, dict) else None
+        m_cost = m_call.get("cost_usd") if isinstance(m_call, dict) else None
+        j_cost = j_call.get("cost_usd") if isinstance(j_call, dict) else None
+        m_total = float(getattr(run_cfg, "cost_total_usd_model", 0.0) or 0.0)
+        j_total = float(getattr(run_cfg, "cost_total_usd_judge", 0.0) or 0.0)
+        cost_part = ""
+        if isinstance(m_cost, (int, float)) or isinstance(j_cost, (int, float)):
+            cost_part = (
+                f"  cost_usd(model={float(m_cost or 0.0):.6f},judge={float(j_cost or 0.0):.6f})"
+                f"  totals_usd(model={m_total:.6f},judge={j_total:.6f})"
+            )
         print(
-            f"[{idx}/{total}] id={qid}  FINAL {round_idx}/{vote_n}  mcq={mcq}  gold={gold_norm}  pred={extracted_final_answer}  judge_correct={judge_correct}  model_ms={model_wall_ms}  judge_ms={(judge_latency_ms or 0)}  total_ms={total_ms}",
+            f"[{idx}/{total}] id={qid}  FINAL {round_idx}/{vote_n}  mcq={mcq}  gold={gold_norm}  pred={extracted_final_answer}  judge_correct={judge_correct}  model_ms={model_wall_ms}  judge_ms={(judge_latency_ms or 0)}  total_ms={total_ms}{cost_part}",
             flush=True,
         )
         print(f"   model_text: {_preview(final_out.get('model_text') or '')}", flush=True)
@@ -1880,11 +1937,18 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
     )
 
     ap.add_argument(
-        "--reasoning-effort",
+        "--model-reasoning-effort",
         type=str,
         choices=["off", "xhigh", "high", "medium", "low", "minimal", "none"],
         default=None,
-        help="OpenRouter reasoning effort. off => do not send reasoning.effort. Otherwise send reasoning.effort with provider.require_parameters=true.",
+        help="OpenRouter reasoning effort for the answering model. off => do not send reasoning.effort.",
+    )
+    ap.add_argument(
+        "--judge-reasoning-effort",
+        type=str,
+        choices=["off", "xhigh", "high", "medium", "low", "minimal", "none"],
+        default=None,
+        help="OpenRouter reasoning effort for the judge model. off => do not send reasoning.effort.",
     )
 
     # VPN/proxy switch
@@ -2049,10 +2113,15 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
             if args.mcq_cardinality_hint is not None
             else cfg.get("mcq_cardinality_hint", "off")
         ),
-        reasoning_effort=str(
-            args.reasoning_effort
-            if args.reasoning_effort is not None
-            else cfg.get("reasoning_effort", "off")
+        model_reasoning_effort=str(
+            args.model_reasoning_effort
+            if args.model_reasoning_effort is not None
+            else cfg.get("model_reasoning_effort", cfg.get("reasoning_effort", "off"))
+        ),
+        judge_reasoning_effort=str(
+            args.judge_reasoning_effort
+            if args.judge_reasoning_effort is not None
+            else cfg.get("judge_reasoning_effort", cfg.get("reasoning_effort", "off"))
         ),
         vpn=(args.vpn if args.vpn is not None else cfg.get("vpn", "off")),
         proxy=args.proxy or cfg.get("proxy", ""),

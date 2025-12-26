@@ -105,7 +105,8 @@ def _build_arg_list(cfg: Dict[str, Any]) -> List[str]:
     add("--answer-json-max-attempts", cfg.get("answer_json_max_attempts"))
     add("--majority-vote", cfg.get("majority_vote"))
     add("--mcq-cardinality-hint", cfg.get("mcq_cardinality_hint"))
-    add("--reasoning-effort", cfg.get("reasoning_effort"))
+    add("--model-reasoning-effort", cfg.get("model_reasoning_effort"))
+    add("--judge-reasoning-effort", cfg.get("judge_reasoning_effort"))
 
     # Network
     add("--vpn", cfg.get("vpn"))
@@ -210,7 +211,8 @@ class ParamToolApp:
         return {
             "cot": "off",
             "mcq_cardinality_hint": "off",
-            "reasoning_effort": "off",
+            "model_reasoning_effort": "off",
+            "judge_reasoning_effort": "off",
             "vpn": "off",
             "proxy": "http://127.0.0.1:7897",
             "concurrency": 1,
@@ -368,8 +370,17 @@ class ParamToolApp:
             width=12,
         ); r += 1
         self._add_field(
-            "reasoning_effort",
-            "--reasoning-effort (OpenRouter 推理努力度：off/xhigh/high/medium/low/minimal/none)",
+            "model_reasoning_effort",
+            "--model-reasoning-effort (OpenRouter 模型推理努力度：off/xhigh/high/medium/low/minimal/none)",
+            r,
+            main,
+            kind="combo",
+            values=["off", "xhigh", "high", "medium", "low", "minimal", "none"],
+            width=12,
+        ); r += 1
+        self._add_field(
+            "judge_reasoning_effort",
+            "--judge-reasoning-effort (OpenRouter 裁判推理努力度：off/xhigh/high/medium/low/minimal/none)",
             r,
             main,
             kind="combo",
@@ -511,7 +522,15 @@ class ParamToolApp:
                 cfg[k] = v
 
         # enums
-        for k in ["cot", "mcq_cardinality_hint", "reasoning_effort", "vpn", "model_provider", "judge_provider"]:
+        for k in [
+            "cot",
+            "mcq_cardinality_hint",
+            "model_reasoning_effort",
+            "judge_reasoning_effort",
+            "vpn",
+            "model_provider",
+            "judge_provider",
+        ]:
             v = get_s(k)
             if not _is_blank(v):
                 cfg[k] = v
@@ -720,7 +739,8 @@ class ParamToolApp:
             "--limit": "limit",
             "--cot": "cot",
             "--mcq-cardinality-hint": "mcq_cardinality_hint",
-            "--reasoning-effort": "reasoning_effort",
+            "--model-reasoning-effort": "model_reasoning_effort",
+            "--judge-reasoning-effort": "judge_reasoning_effort",
             "--answer-json-max-attempts": "answer_json_max_attempts",
             "--majority-vote": "majority_vote",
             "--vpn": "vpn",
@@ -1013,7 +1033,8 @@ class ParamToolApp:
                     answer_json_max_attempts=int(cfg.get("answer_json_max_attempts", 1) or 1),
                     majority_vote=1,
                     mcq_cardinality_hint=str(cfg.get("mcq_cardinality_hint", "off") or "off"),
-                    reasoning_effort=str(cfg.get("reasoning_effort", "off") or "off"),
+                    model_reasoning_effort=str(cfg.get("model_reasoning_effort", "off") or "off"),
+                    judge_reasoning_effort=str(cfg.get("judge_reasoning_effort", "off") or "off"),
                     vpn=str(cfg.get("vpn", "off") or "off"),
                     proxy=str(cfg.get("proxy", "") or ""),
                 )
@@ -1025,7 +1046,13 @@ class ParamToolApp:
                         return
                     prov = eval_questions.LLMProvider(pcfg, run_cfg)
                     t0 = eval_questions.now_ms()
-                    resp = await prov.call("Reply with ONLY a JSON object: {\"ok\": true}", image_data_url=None, label=f"connectivity:{name}")
+                    resp = await prov.call(
+                        "Reply with ONLY a JSON object: {\"ok\": true}",
+                        image_data_url=None,
+                        label=f"connectivity:{name}",
+                        role="other",
+                        reasoning_effort=str(cfg.get("model_reasoning_effort", "off") or "off"),
+                    )
                     t1 = eval_questions.now_ms()
                     if self._cancel_event is not None and self._cancel_event.is_set():
                         self._log_q.put(f"{name}: CANCELLED\n")
