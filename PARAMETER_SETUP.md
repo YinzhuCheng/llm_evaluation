@@ -153,6 +153,13 @@ python eval_questions.py \
 - **`--proxy`**：例如 `http://127.0.0.1:7897` 或 `socks5://127.0.0.1:7897`
 
 ### 7) Token/温度/超时（Model/Judge 都可配）
+### 8) `--reasoning-effort`（OpenRouter 推理努力度）
+- **作用**：仅在 `--model-provider openrouter` / `--judge-provider openrouter` 时生效。  
+  开启后会在请求中发送 `reasoning.effort`，并附加 `provider.require_parameters=true` 做强校验（若下游不支持该参数会直接报错并中止本次评测）。
+- **默认**：`off`（不发送该参数）
+- **取值**：`off` / `xhigh` / `high` / `medium` / `low` / `minimal` / `none`
+- **YAML**：`reasoning_effort: off`
+
 - `--model-max-tokens` / `--judge-max-tokens`
 - `--model-temperature` / `--judge-temperature`
 - `--model-timeout-s` / `--judge-timeout-s`

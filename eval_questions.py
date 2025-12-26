@@ -484,7 +484,7 @@ def _sanitize_call_for_logging(provider: str, call_obj: Optional[Dict[str, Any]]
 
 @dataclass
 class ProviderConfig:
-    provider: str  # openai | gemini | claude
+    provider: str  # openai | openrouter | gemini | claude
     base_url: str
     api_key: str
     model: str
@@ -520,6 +520,14 @@ class RunConfig:
     # NEW: MCQ prompt hint about single-vs-multi answer (derived from gold Answer)
     # on/off (string for CLI/GUI consistency)
     mcq_cardinality_hint: str = "off"
+
+    # NEW: reasoning effort (OpenRouter)
+    # - off => do not send the parameter
+    # - otherwise send reasoning.effort in the request
+    reasoning_effort: str = "off"  # off/xhigh/high/medium/low/minimal/none
+
+    # OpenRouter cost tracking (best-effort)
+    cost_total_usd: float = 0.0
 
     # vpn/proxy switch
     vpn: str = "off"       # on/off
@@ -594,12 +602,12 @@ class LLMProvider:
         self.cfg = cfg
         self.run_cfg = run_cfg
 
-    async def call(self, prompt: str, image_data_url: Optional[str] = None) -> Dict[str, Any]:
+    async def call(self, prompt: str, image_data_url: Optional[str] = None, *, label: str = "") -> Dict[str, Any]:
         if self.run_cfg.cancel_event is not None and self.run_cfg.cancel_event.is_set():
             return {"request": None, "response": None, "error": "cancelled", "attempts": 0, "status": None}
         p = self.cfg.provider.lower()
-        if p == "openai":
-            return await self._call_openai_chat_completions(prompt, image_data_url)
+        if p in {"openai", "openrouter"}:
+            return await self._call_openai_chat_completions(prompt, image_data_url, label=label)
         elif p == "gemini":
             return await self._call_gemini(prompt, image_data_url)
         elif p == "claude":
@@ -607,9 +615,14 @@ class LLMProvider:
         else:
             raise ValueError(f"Unknown provider: {self.cfg.provider}")
 
-    async def _call_openai_chat_completions(self, prompt: str, image_data_url: Optional[str]) -> Dict[str, Any]:
+    async def _call_openai_chat_completions(self, prompt: str, image_data_url: Optional[str], *, label: str = "") -> Dict[str, Any]:
         url = self.cfg.base_url.rstrip("/") + "/v1/chat/completions"
         headers = {"Authorization": f"Bearer {self.cfg.api_key}"}
+        p = (self.cfg.provider or "").lower()
+        if p == "openrouter":
+            # Recommended by OpenRouter for attribution/analytics; safe defaults.
+            headers.setdefault("HTTP-Referer", "https://localhost/")
+            headers.setdefault("X-Title", "llm-evaluation")
 
         if image_data_url:
             user_content = [
@@ -619,7 +632,7 @@ class LLMProvider:
         else:
             user_content = prompt
 
-        payload = {
+        payload: Dict[str, Any] = {
             "model": self.cfg.model,
             "temperature": self.cfg.temperature,
             "top_p": self.cfg.top_p,
@@ -630,18 +643,76 @@ class LLMProvider:
             ],
         }
 
+        # OpenRouter: optional reasoning effort + require_parameters guard.
+        if p == "openrouter":
+            eff = (getattr(self.run_cfg, "reasoning_effort", "off") or "off").strip().lower()
+            if eff and eff != "off":
+                payload["reasoning"] = {"effort": eff}
+                payload["provider"] = {"require_parameters": True}
+
         async with make_async_client(self.run_cfg) as client:
             resp, err, attempts = await request_with_retry(
                 client, "POST", url, headers, payload,
                 self.cfg.timeout_s, self.run_cfg.max_retries,
                 self.run_cfg.retry_base_delay_s, self.run_cfg.retry_max_delay_s
             )
+            # Best-effort: OpenRouter cost query + fatal parameter guard
+            cost_usd: Optional[float] = None
+            cost_total_usd: Optional[float] = None
+            if p == "openrouter" and resp is not None:
+                try:
+                    # If require_parameters fails, OpenRouter should respond with a 4xx + error JSON.
+                    if isinstance(resp.status_code, int) and resp.status_code >= 400:
+                        try:
+                            j = resp.json()
+                        except Exception:
+                            j = None
+                        msg = None
+                        if isinstance(j, dict):
+                            msg = (j.get("error") or {}).get("message") if isinstance(j.get("error"), dict) else j.get("message")
+                        if msg and ("require_parameters" in str(msg) or "reasoning" in str(msg) or "effort" in str(msg)):
+                            if self.run_cfg.cancel_event is not None:
+                                self.run_cfg.cancel_event.set()
+                            print(
+                                f"[OPENROUTER] Parameter not supported (reasoning.effort). "
+                                f"Disable reasoning effort and re-run. error={msg}",
+                                flush=True,
+                            )
+                            raise RuntimeError(
+                                "OpenRouter rejected reasoning.effort with provider.require_parameters=true. "
+                                "Disable --reasoning-effort (set to off) and re-run. "
+                                f"Details: {msg}"
+                            )
+                except Exception:
+                    pass
+
+                try:
+                    rj = self._resp_json(resp)
+                    gen_id = rj.get("id") if isinstance(rj, dict) else None
+                    if isinstance(gen_id, str) and gen_id:
+                        cost_usd = await _openrouter_query_cost_usd(
+                            client=client,
+                            base_url=self.cfg.base_url,
+                            api_key=self.cfg.api_key,
+                            gen_id=gen_id,
+                            run_cfg=self.run_cfg,
+                        )
+                        if isinstance(cost_usd, (int, float)):
+                            # Best-effort: simple sum; concurrency ordering not guaranteed (acceptable per requirement).
+                            self.run_cfg.cost_total_usd = float(getattr(self.run_cfg, "cost_total_usd", 0.0) or 0.0) + float(cost_usd)
+                            cost_total_usd = float(self.run_cfg.cost_total_usd)
+                            tag = label or "call"
+                            print(f"[OPENROUTER COST] {tag}  cost_usd={cost_usd:.6f}  total_usd={cost_total_usd:.6f}", flush=True)
+                except Exception:
+                    pass
         return {
             "request": payload,
             "response": self._resp_json(resp),
             "error": err,
             "attempts": attempts,
             "status": getattr(resp, "status_code", None),
+            "cost_usd": cost_usd,
+            "cost_total_usd": cost_total_usd,
         }
 
     async def _call_gemini(self, prompt: str, image_data_url: Optional[str]) -> Dict[str, Any]:
@@ -731,6 +802,7 @@ def normalize_api_protocol(name: str) -> str:
     Normalize user-facing protocol names to internal provider ids.
     Supported (case-insensitive):
     - OpenAI -> openai
+    - OpenRouter -> openrouter
     - Anthropic -> claude
     - Google -> gemini
     Also accepts legacy ids: openai/claude/gemini
@@ -738,11 +810,63 @@ def normalize_api_protocol(name: str) -> str:
     s = (name or "").strip().lower()
     if s in {"openai"}:
         return "openai"
+    if s in {"openrouter"}:
+        return "openrouter"
     if s in {"anthropic", "claude"}:
         return "claude"
     if s in {"google", "gemini"}:
         return "gemini"
     return s
+
+
+async def _openrouter_query_cost_usd(
+    *,
+    client: httpx.AsyncClient,
+    base_url: str,
+    api_key: str,
+    gen_id: str,
+    run_cfg: RunConfig,
+) -> Optional[float]:
+    """
+    Best-effort cost query for OpenRouter using generation id.
+    Works only for provider=openrouter.
+    """
+    url = base_url.rstrip("/") + "/v1/generation"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        resp = await client.get(url, params={"id": gen_id}, headers=headers, timeout=run_cfg.retry_max_delay_s or 20.0)
+        if resp.status_code >= 400:
+            return None
+        j = resp.json()
+        if not isinstance(j, dict):
+            return None
+        data = j.get("data")
+        if isinstance(data, dict):
+            # Try common locations
+            for path in [
+                ("total_cost",),
+                ("usage", "total_cost"),
+                ("usage", "total_cost_usd"),
+                ("usage", "cost"),
+            ]:
+                cur: Any = data
+                ok = True
+                for k in path:
+                    if isinstance(cur, dict) and k in cur:
+                        cur = cur.get(k)
+                    else:
+                        ok = False
+                        break
+                if ok and isinstance(cur, (int, float)):
+                    return float(cur)
+        # fallback: search top-level keys
+        for k in ("total_cost", "total_cost_usd", "cost"):
+            v = j.get(k)
+            if isinstance(v, (int, float)):
+                return float(v)
+    except Exception:
+        return None
+    return None
 
 
 def extract_text_from_provider_response(provider: str, resp_json: Any) -> str:
@@ -1131,7 +1255,7 @@ async def eval_one(
                 prompt = build_answer_json_retry_prefix(k + 1, answer_parse_error or "unknown") + base_prompt
 
             async with model_sem:
-                model_call = await model_provider.call(prompt=prompt, image_data_url=image_data_url)
+                model_call = await model_provider.call(prompt=prompt, image_data_url=image_data_url, label=f"model id={qid} idx={idx}")
 
             model_text = extract_text_from_provider_response(
                 model_provider.cfg.provider, (model_call or {}).get("response")
@@ -1282,7 +1406,7 @@ async def eval_one(
 
             async with judge_sem:
                 jt0 = now_ms()
-                judge_call = await judge_provider.call(prompt=judge_prompt, image_data_url=None)
+                judge_call = await judge_provider.call(prompt=judge_prompt, image_data_url=None, label=f"judge id={qid} idx={idx}")
                 jt1 = now_ms()
 
             judge_latency_ms = jt1 - jt0
@@ -1728,6 +1852,14 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
         help="MCQ prompt hint: tell the answering model whether the gold answer is single-choice or multi-choice (on/off). Default: on.",
     )
 
+    ap.add_argument(
+        "--reasoning-effort",
+        type=str,
+        choices=["off", "xhigh", "high", "medium", "low", "minimal", "none"],
+        default=None,
+        help="OpenRouter reasoning effort. off => do not send reasoning.effort. Otherwise send reasoning.effort with provider.require_parameters=true.",
+    )
+
     # VPN/proxy switch
     ap.add_argument("--vpn", type=str, choices=["on", "off"], default=None,
                     help="VPN mode switch: on=use proxy, off=direct")
@@ -1890,10 +2022,16 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
             if args.mcq_cardinality_hint is not None
             else cfg.get("mcq_cardinality_hint", "off")
         ),
+        reasoning_effort=str(
+            args.reasoning_effort
+            if args.reasoning_effort is not None
+            else cfg.get("reasoning_effort", "off")
+        ),
         vpn=(args.vpn if args.vpn is not None else cfg.get("vpn", "off")),
         proxy=args.proxy or cfg.get("proxy", ""),
     )
-    run_cfg.cancel_event = cancel_event
+    # Always have an event available so we can stop the run on fatal config/parameter issues.
+    run_cfg.cancel_event = cancel_event if cancel_event is not None else threading.Event()
 
     # Read xlsx
     df = pd.read_excel(run_cfg.input_path, sheet_name=run_cfg.sheet_name, engine="openpyxl")

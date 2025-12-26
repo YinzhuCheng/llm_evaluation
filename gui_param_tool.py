@@ -105,6 +105,7 @@ def _build_arg_list(cfg: Dict[str, Any]) -> List[str]:
     add("--answer-json-max-attempts", cfg.get("answer_json_max_attempts"))
     add("--majority-vote", cfg.get("majority_vote"))
     add("--mcq-cardinality-hint", cfg.get("mcq_cardinality_hint"))
+    add("--reasoning-effort", cfg.get("reasoning_effort"))
 
     # Network
     add("--vpn", cfg.get("vpn"))
@@ -209,6 +210,7 @@ class ParamToolApp:
         return {
             "cot": "off",
             "mcq_cardinality_hint": "off",
+            "reasoning_effort": "off",
             "vpn": "off",
             "proxy": "http://127.0.0.1:7897",
             "concurrency": 1,
@@ -365,6 +367,15 @@ class ParamToolApp:
             values=["on", "off"],
             width=12,
         ); r += 1
+        self._add_field(
+            "reasoning_effort",
+            "--reasoning-effort (OpenRouter 推理努力度：off/xhigh/high/medium/low/minimal/none)",
+            r,
+            main,
+            kind="combo",
+            values=["off", "xhigh", "high", "medium", "low", "minimal", "none"],
+            width=12,
+        ); r += 1
         self._add_field("concurrency", "--concurrency (并发数：同时向大模型并发多少条消息)", r, main, width=12); r += 1
         self._add_field("max_retries", "--max-retries (网络/接口失败重试次数，指数退避)", r, main, width=12); r += 1
 
@@ -377,11 +388,11 @@ class ParamToolApp:
         r = 0
         self._add_field(
             "model_provider",
-            "--api-protocol (API协议：OpenAI/Anthropic/Google)",
+            "--api-protocol (API协议：OpenAI/OpenRouter/Anthropic/Google)",
             r,
             model,
             kind="combo",
-            values=["OpenAI", "Anthropic", "Google"],
+            values=["OpenAI", "OpenRouter", "Anthropic", "Google"],
             width=12,
         ); r += 1
         self._add_field("model_base_url", "--model-base-url (接口地址，如 https://api.openai.com)", r, model); r += 1
@@ -397,11 +408,11 @@ class ParamToolApp:
         r += 1
         self._add_field(
             "judge_provider",
-            "--judge-api-protocol (API协议：OpenAI/Anthropic/Google)",
+            "--judge-api-protocol (API协议：OpenAI/OpenRouter/Anthropic/Google)",
             r,
             judge,
             kind="combo",
-            values=["OpenAI", "Anthropic", "Google"],
+            values=["OpenAI", "OpenRouter", "Anthropic", "Google"],
             width=12,
         ); r += 1
         self._add_field("judge_base_url", "--judge-base-url (接口地址)", r, judge); r += 1
@@ -500,7 +511,7 @@ class ParamToolApp:
                 cfg[k] = v
 
         # enums
-        for k in ["cot", "mcq_cardinality_hint", "vpn", "model_provider", "judge_provider"]:
+        for k in ["cot", "mcq_cardinality_hint", "reasoning_effort", "vpn", "model_provider", "judge_provider"]:
             v = get_s(k)
             if not _is_blank(v):
                 cfg[k] = v
@@ -709,6 +720,7 @@ class ParamToolApp:
             "--limit": "limit",
             "--cot": "cot",
             "--mcq-cardinality-hint": "mcq_cardinality_hint",
+            "--reasoning-effort": "reasoning_effort",
             "--answer-json-max-attempts": "answer_json_max_attempts",
             "--majority-vote": "majority_vote",
             "--vpn": "vpn",
@@ -1001,6 +1013,7 @@ class ParamToolApp:
                     answer_json_max_attempts=int(cfg.get("answer_json_max_attempts", 1) or 1),
                     majority_vote=1,
                     mcq_cardinality_hint=str(cfg.get("mcq_cardinality_hint", "off") or "off"),
+                    reasoning_effort=str(cfg.get("reasoning_effort", "off") or "off"),
                     vpn=str(cfg.get("vpn", "off") or "off"),
                     proxy=str(cfg.get("proxy", "") or ""),
                 )
@@ -1012,7 +1025,7 @@ class ParamToolApp:
                         return
                     prov = eval_questions.LLMProvider(pcfg, run_cfg)
                     t0 = eval_questions.now_ms()
-                    resp = await prov.call("Reply with ONLY a JSON object: {\"ok\": true}", image_data_url=None)
+                    resp = await prov.call("Reply with ONLY a JSON object: {\"ok\": true}", image_data_url=None, label=f"connectivity:{name}")
                     t1 = eval_questions.now_ms()
                     if self._cancel_event is not None and self._cancel_event.is_set():
                         self._log_q.put(f"{name}: CANCELLED\n")
