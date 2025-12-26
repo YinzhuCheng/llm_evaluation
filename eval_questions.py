@@ -1089,6 +1089,32 @@ def build_mcq_judge_prompt_minimal(model_answer: str, gold_letters_csv: str) -> 
     )
 
 
+def build_mcq_judge_prompt_from_raw(model_output: str, gold_letters_csv: str) -> str:
+    """
+    Judge prompt for MCQ when the answering-model JSON parsing failed.
+    The judge must extract option letters from the raw model output, then compare to gold set.
+    """
+    return (
+        "You are a strict evaluator for a multiple-choice question. Some questions may have multiple correct options.\n"
+        "Your tasks:\n"
+        "1) Extract the option letters chosen by the model (A-E) from the MODEL OUTPUT.\n"
+        "2) Treat answers as a SET (order-insensitive; duplicates ignored).\n"
+        "3) The answer is correct ONLY IF the extracted set exactly equals the gold set.\n\n"
+        "Return ONLY a JSON object. No markdown, no extra text.\n"
+        "The JSON schema is:\n"
+        "{\n"
+        '  "verdict": "correct" | "incorrect" | "unjudgeable",\n'
+        '  "extracted_answer": string|null,\n'
+        '  "reason": string\n'
+        "}\n"
+        'Notes:\n'
+        '- If you can extract letters, set extracted_answer to a normalized CSV like "A" or "A,B,C" (no spaces).\n'
+        '- If the model does not provide a usable answer, set verdict="unjudgeable".\n\n'
+        f"Gold Answer (letters CSV):\n{gold_letters_csv}\n\n"
+        f"Model Output:\n{model_output}\n"
+    )
+
+
 
 
 
@@ -1459,13 +1485,25 @@ async def eval_one(
         judge_call_log = None
         judge_latency_ms: Optional[int] = None
 
-        if judge_provider is not None and extracted_final_answer is not None:
+        if judge_provider is not None:
+            # Adaptive judging:
+            # - If we have an extracted/voted final answer, judge on that short answer.
+            # - If JSON parsing failed (no extracted answer), fall back to judging from the raw model output.
+            judge_input_kind = "extracted"
             if mcq:
-                judge_prompt = build_mcq_judge_prompt_minimal(extracted_final_answer, gold_norm)
+                if extracted_final_answer is not None:
+                    judge_prompt = build_mcq_judge_prompt_minimal(extracted_final_answer, gold_norm)
+                else:
+                    judge_input_kind = "raw_model_text"
+                    judge_prompt = build_mcq_judge_prompt_from_raw(strip_base64_payloads(one.get("model_text") or ""), gold_norm)
             else:
                 q_clean = strip_base64_payloads(question)
                 gold_clean = strip_base64_payloads(gold_raw)
-                ans_clean = strip_base64_payloads(extracted_final_answer)
+                if extracted_final_answer is not None:
+                    ans_clean = strip_base64_payloads(extracted_final_answer)
+                else:
+                    judge_input_kind = "raw_model_text"
+                    ans_clean = strip_base64_payloads(one.get("model_text") or "")
                 judge_prompt = build_freeform_judge_prompt(q_clean, ans_clean, gold_clean)
 
             async with judge_sem:
@@ -1494,6 +1532,7 @@ async def eval_one(
                 "judge_text": judge_text,
                 "judge_json": judge_json,
                 "judge_latency_ms": judge_latency_ms,
+                "judge_input_kind": judge_input_kind,
             }
         else:
             # No judge result (e.g., answering JSON failed) => count as incorrect.
