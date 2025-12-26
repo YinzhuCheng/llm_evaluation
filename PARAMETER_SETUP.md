@@ -75,6 +75,7 @@ python eval_questions.py \
 ### 4) 输出目录：`--out-dir`
 - **作用**：保存评测产物（jsonl 逐题日志、summary、输出 Excel）。
 - 默认：`out_run`
+- **输出结构**：每次运行会在 `--out-dir` 下创建一个时间戳子目录，例如 `out_run/20251222_101500/`，本次运行的 `results_*.jsonl` / `summary_*.json` / `evaluated_*.xlsx` 都会写入该子目录。
 
 ---
 
@@ -94,8 +95,15 @@ python eval_questions.py \
   - 选择题：建议为 `A` 或 `A,B,C`（不含空格更稳）
   - 非选择题：直接写参考答案文本
 - **`Image`**：图片相对路径或绝对路径（可空）
-- **`Image_Dependency`**：是否强依赖图片（0/1）
-  - 为 1 且图片缺失时，默认会跳过该题（skipped）
+- **`Image.1`**：第二张图片（可选；当前脚本会优先使用 `Image`，缺失时尝试 `Image.1`）
+- **`Image_Dependency`**：图片依赖程度（0/1/2）
+  - 0：不依赖图片（或无图）
+  - 1：图片可能有帮助，但即使图片缺失也**不跳过**
+  - 2：强依赖图片；图片缺失时默认会跳过该题（skipped）
+- **`Image_Complexity`**：图片复杂度（0/1/2）
+  - 0：无图
+  - 1：图细节简单
+  - 2：图细节丰富
 
 ---
 
@@ -109,6 +117,14 @@ python eval_questions.py \
 
 说明：
 - 无论开关如何，裁判侧仍然只依据最终 `answer` 判定对错（不会把图片/大段内容发给裁判）。
+
+### 1.5) `--mcq-cardinality-hint`（选择题提示：告知单选/多选）
+- **作用**：在选择题提示词中告知答题模型“本题答案是单选还是多选（多于一个选项）”。  
+  - 单选：提示 “EXACTLY ONE option”
+  - 多选：提示 “MORE THAN ONE option”（**不透露具体选几个**）
+- **默认**：`off`
+- **取值**：`on` / `off`
+- **YAML**：`mcq_cardinality_hint: off`
 
 ### 2) `--answer-json-max-attempts`（答题 JSON 解析失败重试次数）
 - **作用**：当答题模型输出无法解析为 JSON 时，脚本会对同一题进行“内容级重试”（重新询问答题模型要求严格 JSON）。
@@ -137,6 +153,15 @@ python eval_questions.py \
 - **`--proxy`**：例如 `http://127.0.0.1:7897` 或 `socks5://127.0.0.1:7897`
 
 ### 7) Token/温度/超时（Model/Judge 都可配）
+### 8) `--model-reasoning-effort` / `--judge-reasoning-effort`（OpenRouter 推理努力度）
+- **作用**：仅在对应的 provider 为 `openrouter` 时生效。  
+  开启后会在请求中发送 `reasoning.effort`，并附加 `provider.require_parameters=true` 做强校验（若下游不支持该参数会直接报错并中止本次评测）。
+- **默认**：`off`（不发送该参数）
+- **取值**：`off` / `xhigh` / `high` / `medium` / `low` / `minimal` / `none`
+- **YAML**：
+  - `model_reasoning_effort: off`
+  - `judge_reasoning_effort: off`
+
 - `--model-max-tokens` / `--judge-max-tokens`
 - `--model-temperature` / `--judge-temperature`
 - `--model-timeout-s` / `--judge-timeout-s`
@@ -167,6 +192,7 @@ retry_max_delay_s: 16.0
 limit:
 
 cot: off
+mcq_cardinality_hint: off
 answer_json_max_attempts: 3
 vpn: off
 proxy: ""
@@ -200,7 +226,7 @@ python eval_questions.py --config config.yaml
 
 ## 输出结果会生成什么？
 
-在 `--out-dir` 下会生成：
+在 `--out-dir/<timestamp>/` 下会生成：
 - `results_*.jsonl`：逐题完整日志（包含 model/judge 调用的脱敏请求结构与响应摘要）
 - `summary_*.json`：整体统计（包含 overall 分数、网络/配置摘要等）
 - `summary_*.json` 还会包含 `breakdowns`：按题型/难度/领域/Image_Dependency（若数据列存在）分组的正确率统计

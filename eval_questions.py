@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import base64
+import datetime as dt
 import json
 import os
 import random
@@ -27,6 +28,52 @@ FINAL_ANSWER_RE = re.compile(
 )
 
 RETRIABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+# Excel (openpyxl) cannot store certain control characters in worksheets.
+# Mirror openpyxl's illegal-char policy:
+# - illegal: 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F
+# - allowed: tab(0x09), LF(0x0A), CR(0x0D)
+_ILLEGAL_EXCEL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+def _excel_safe_str(s: str) -> str:
+    if not s:
+        return ""
+    return _ILLEGAL_EXCEL_CHARS_RE.sub("", s)
+
+def _excel_safe_cell(v: Any) -> Any:
+    """
+    Convert a cell value into something safe for openpyxl.
+    - Keeps numbers/bools/datetime-like as-is
+    - Cleans illegal control chars from strings
+    - Converts dict/list to JSON string then cleans
+    """
+    if v is None:
+        return None
+    try:
+        if is_nan(v):
+            return v
+    except Exception:
+        pass
+
+    if isinstance(v, (bool, int, float)):
+        return v
+    if isinstance(v, (dt.datetime, dt.date, dt.time)):
+        return v
+    # pandas Timestamp / NaT
+    try:
+        if isinstance(v, pd.Timestamp):
+            return v
+    except Exception:
+        pass
+
+    if isinstance(v, str):
+        return _excel_safe_str(v)
+    if isinstance(v, (dict, list)):
+        try:
+            return _excel_safe_str(json.dumps(v, ensure_ascii=False))
+        except Exception:
+            return _excel_safe_str(str(v))
+    return _excel_safe_str(str(v))
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -254,6 +301,43 @@ def extract_first_json_object(s: str) -> Optional[str]:
     return None
 
 
+def extract_first_json_object_strict(s: str) -> Optional[str]:
+    """
+    Streaming extraction of the first JSON object from text.
+    More robust than using rfind('}') when extra text follows JSON.
+    """
+    if not s:
+        return None
+    candidate = _strip_markdown_code_fences(str(s)).strip()
+    start = candidate.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(candidate)):
+        ch = candidate[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return candidate[start : i + 1].strip()
+    return None
+
+
 def parse_answer_json(text: str, *, mcq: bool) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Parse answering-model output as a strict JSON object.
@@ -262,7 +346,7 @@ def parse_answer_json(text: str, *, mcq: bool) -> Tuple[Optional[Dict[str, Any]]
     - Freeform: answer can be string/number/boolean/list[string] (cast to string; list joined by newlines)
     """
     raw = (text or "").strip()
-    candidate = extract_first_json_object(raw)
+    candidate = extract_first_json_object_strict(raw) or extract_first_json_object(raw)
     if not candidate:
         return None, "no_json_object_found"
     try:
@@ -341,7 +425,7 @@ def _sanitize_call_for_logging(provider: str, call_obj: Optional[Dict[str, Any]]
     req2 = dict(req)
 
     try:
-        if p == "openai":
+        if p in {"openai", "openrouter"}:
             # messages: [{role, content}, ...]
             messages = req2.get("messages")
             if isinstance(messages, list):
@@ -428,6 +512,36 @@ def _sanitize_call_for_logging(provider: str, call_obj: Optional[Dict[str, Any]]
         pass
 
     out["request"] = req2
+
+    # Also sanitize RESPONSE (best-effort) to avoid huge unreadable blobs in jsonl logs
+    try:
+        resp = out.get("response")
+        if isinstance(resp, dict):
+            # deep-ish copy via JSON (safe for plain dict/list scalars)
+            resp2 = json.loads(json.dumps(resp))
+            choices = resp2.get("choices")
+            if isinstance(choices, list):
+                for ch in choices:
+                    if not isinstance(ch, dict):
+                        continue
+                    msg = ch.get("message")
+                    if isinstance(msg, dict):
+                        rd = msg.get("reasoning_details")
+                        if isinstance(rd, list):
+                            new_rd = []
+                            for it in rd:
+                                if isinstance(it, dict) and it.get("type") == "reasoning.encrypted":
+                                    it2 = dict(it)
+                                    it2["data"] = "<omitted>"
+                                    new_rd.append(it2)
+                                else:
+                                    new_rd.append(it)
+                            msg["reasoning_details"] = new_rd
+                        if isinstance(msg.get("reasoning"), str):
+                            msg["reasoning"] = strip_base64_payloads(msg.get("reasoning"))
+            out["response"] = resp2
+    except Exception:
+        pass
     return out
 
 
@@ -437,7 +551,7 @@ def _sanitize_call_for_logging(provider: str, call_obj: Optional[Dict[str, Any]]
 
 @dataclass
 class ProviderConfig:
-    provider: str  # openai | gemini | claude
+    provider: str  # openai | openrouter | gemini | claude
     base_url: str
     api_key: str
     model: str
@@ -469,6 +583,20 @@ class RunConfig:
 
     # NEW: majority vote (answering model called N times; take majority answer)
     majority_vote: int = 1
+
+    # NEW: MCQ prompt hint about single-vs-multi answer (derived from gold Answer)
+    # on/off (string for CLI/GUI consistency)
+    mcq_cardinality_hint: str = "off"
+
+    # NEW: reasoning effort (OpenRouter)
+    # - off => do not send the parameter
+    # - otherwise send reasoning.effort in the request
+    model_reasoning_effort: str = "off"  # off/xhigh/high/medium/low/minimal/none
+    judge_reasoning_effort: str = "off"  # off/xhigh/high/medium/low/minimal/none
+
+    # OpenRouter cost tracking (best-effort, USD)
+    cost_total_usd_model: float = 0.0
+    cost_total_usd_judge: float = 0.0
 
     # vpn/proxy switch
     vpn: str = "off"       # on/off
@@ -543,12 +671,22 @@ class LLMProvider:
         self.cfg = cfg
         self.run_cfg = run_cfg
 
-    async def call(self, prompt: str, image_data_url: Optional[str] = None) -> Dict[str, Any]:
+    async def call(
+        self,
+        prompt: str,
+        image_data_url: Optional[str] = None,
+        *,
+        label: str = "",
+        role: str = "other",  # model|judge|other (used for cost buckets)
+        reasoning_effort: str = "off",
+    ) -> Dict[str, Any]:
         if self.run_cfg.cancel_event is not None and self.run_cfg.cancel_event.is_set():
             return {"request": None, "response": None, "error": "cancelled", "attempts": 0, "status": None}
         p = self.cfg.provider.lower()
-        if p == "openai":
-            return await self._call_openai_chat_completions(prompt, image_data_url)
+        if p in {"openai", "openrouter"}:
+            return await self._call_openai_chat_completions(
+                prompt, image_data_url, label=label, role=role, reasoning_effort=reasoning_effort
+            )
         elif p == "gemini":
             return await self._call_gemini(prompt, image_data_url)
         elif p == "claude":
@@ -556,9 +694,22 @@ class LLMProvider:
         else:
             raise ValueError(f"Unknown provider: {self.cfg.provider}")
 
-    async def _call_openai_chat_completions(self, prompt: str, image_data_url: Optional[str]) -> Dict[str, Any]:
+    async def _call_openai_chat_completions(
+        self,
+        prompt: str,
+        image_data_url: Optional[str],
+        *,
+        label: str = "",
+        role: str = "other",
+        reasoning_effort: str = "off",
+    ) -> Dict[str, Any]:
         url = self.cfg.base_url.rstrip("/") + "/v1/chat/completions"
         headers = {"Authorization": f"Bearer {self.cfg.api_key}"}
+        p = (self.cfg.provider or "").lower()
+        if p == "openrouter":
+            # Recommended by OpenRouter for attribution/analytics; safe defaults.
+            headers.setdefault("HTTP-Referer", "https://localhost/")
+            headers.setdefault("X-Title", "llm-evaluation")
 
         if image_data_url:
             user_content = [
@@ -568,7 +719,7 @@ class LLMProvider:
         else:
             user_content = prompt
 
-        payload = {
+        payload: Dict[str, Any] = {
             "model": self.cfg.model,
             "temperature": self.cfg.temperature,
             "top_p": self.cfg.top_p,
@@ -579,18 +730,80 @@ class LLMProvider:
             ],
         }
 
+        # OpenRouter: optional reasoning effort + require_parameters guard.
+        if p == "openrouter":
+            eff = (reasoning_effort or "off").strip().lower()
+            if eff and eff != "off":
+                payload["reasoning"] = {"effort": eff}
+                payload["provider"] = {"require_parameters": True}
+
         async with make_async_client(self.run_cfg) as client:
             resp, err, attempts = await request_with_retry(
                 client, "POST", url, headers, payload,
                 self.cfg.timeout_s, self.run_cfg.max_retries,
                 self.run_cfg.retry_base_delay_s, self.run_cfg.retry_max_delay_s
             )
+            # Best-effort: OpenRouter cost query + fatal parameter guard
+            cost_usd: Optional[float] = None
+            cost_total_usd_model: Optional[float] = None
+            cost_total_usd_judge: Optional[float] = None
+            if p == "openrouter" and resp is not None:
+                try:
+                    # If require_parameters fails, OpenRouter should respond with a 4xx + error JSON.
+                    if isinstance(resp.status_code, int) and resp.status_code >= 400:
+                        try:
+                            j = resp.json()
+                        except Exception:
+                            j = None
+                        msg = None
+                        if isinstance(j, dict):
+                            msg = (j.get("error") or {}).get("message") if isinstance(j.get("error"), dict) else j.get("message")
+                        if msg and ("require_parameters" in str(msg) or "reasoning" in str(msg) or "effort" in str(msg)):
+                            if self.run_cfg.cancel_event is not None:
+                                self.run_cfg.cancel_event.set()
+                            print(
+                                f"[OPENROUTER] Parameter not supported (reasoning.effort). "
+                                f"Disable reasoning effort and re-run. error={msg}",
+                                flush=True,
+                            )
+                            raise RuntimeError(
+                                "OpenRouter rejected reasoning.effort with provider.require_parameters=true. "
+                                "Disable reasoning effort (set to off) and re-run. "
+                                f"Details: {msg}"
+                            )
+                except Exception:
+                    pass
+
+                try:
+                    rj = self._resp_json(resp)
+                    gen_id = rj.get("id") if isinstance(rj, dict) else None
+                    if isinstance(gen_id, str) and gen_id:
+                        cost_usd = await _openrouter_query_cost_usd(
+                            client=client,
+                            base_url=self.cfg.base_url,
+                            api_key=self.cfg.api_key,
+                            gen_id=gen_id,
+                            run_cfg=self.run_cfg,
+                        )
+                        if isinstance(cost_usd, (int, float)):
+                            # Best-effort: simple sum; concurrency ordering not guaranteed (acceptable per requirement).
+                            if role == "model":
+                                self.run_cfg.cost_total_usd_model = float(getattr(self.run_cfg, "cost_total_usd_model", 0.0) or 0.0) + float(cost_usd)
+                            elif role == "judge":
+                                self.run_cfg.cost_total_usd_judge = float(getattr(self.run_cfg, "cost_total_usd_judge", 0.0) or 0.0) + float(cost_usd)
+                            cost_total_usd_model = float(getattr(self.run_cfg, "cost_total_usd_model", 0.0) or 0.0)
+                            cost_total_usd_judge = float(getattr(self.run_cfg, "cost_total_usd_judge", 0.0) or 0.0)
+                except Exception:
+                    pass
         return {
             "request": payload,
             "response": self._resp_json(resp),
             "error": err,
             "attempts": attempts,
             "status": getattr(resp, "status_code", None),
+            "cost_usd": cost_usd,
+            "cost_total_usd_model": cost_total_usd_model,
+            "cost_total_usd_judge": cost_total_usd_judge,
         }
 
     async def _call_gemini(self, prompt: str, image_data_url: Optional[str]) -> Dict[str, Any]:
@@ -680,6 +893,7 @@ def normalize_api_protocol(name: str) -> str:
     Normalize user-facing protocol names to internal provider ids.
     Supported (case-insensitive):
     - OpenAI -> openai
+    - OpenRouter -> openrouter
     - Anthropic -> claude
     - Google -> gemini
     Also accepts legacy ids: openai/claude/gemini
@@ -687,6 +901,8 @@ def normalize_api_protocol(name: str) -> str:
     s = (name or "").strip().lower()
     if s in {"openai"}:
         return "openai"
+    if s in {"openrouter"}:
+        return "openrouter"
     if s in {"anthropic", "claude"}:
         return "claude"
     if s in {"google", "gemini"}:
@@ -694,12 +910,62 @@ def normalize_api_protocol(name: str) -> str:
     return s
 
 
+async def _openrouter_query_cost_usd(
+    *,
+    client: httpx.AsyncClient,
+    base_url: str,
+    api_key: str,
+    gen_id: str,
+    run_cfg: RunConfig,
+) -> Optional[float]:
+    """
+    Best-effort cost query for OpenRouter using generation id.
+    Works only for provider=openrouter.
+    """
+    url = base_url.rstrip("/") + "/v1/generation"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        resp = await client.get(url, params={"id": gen_id}, headers=headers, timeout=run_cfg.retry_max_delay_s or 20.0)
+        if resp.status_code >= 400:
+            return None
+        j = resp.json()
+        if not isinstance(j, dict):
+            return None
+        data = j.get("data")
+        if isinstance(data, dict):
+            # Try common locations
+            for path in [
+                ("total_cost",),
+                ("usage", "total_cost"),
+                ("usage", "total_cost_usd"),
+                ("usage", "cost"),
+            ]:
+                cur: Any = data
+                ok = True
+                for k in path:
+                    if isinstance(cur, dict) and k in cur:
+                        cur = cur.get(k)
+                    else:
+                        ok = False
+                        break
+                if ok and isinstance(cur, (int, float)):
+                    return float(cur)
+        # fallback: search top-level keys
+        for k in ("total_cost", "total_cost_usd", "cost"):
+            v = j.get(k)
+            if isinstance(v, (int, float)):
+                return float(v)
+    except Exception:
+        return None
+    return None
+
+
 def extract_text_from_provider_response(provider: str, resp_json: Any) -> str:
     if not resp_json:
         return ""
     p = provider.lower()
     try:
-        if p == "openai":
+        if p in {"openai", "openrouter"}:
             choices = resp_json.get("choices", [])
             if not choices:
                 return ""
@@ -735,12 +1001,19 @@ def extract_text_from_provider_response(provider: str, resp_json: Any) -> str:
 # Prompting
 # ----------------------------
 
-def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
+def build_mcq_prompt(question: str, options: List[str], cot_on: bool, *, multi_answer: Optional[bool] = None) -> str:
     opts = "\n".join(options)
+    if multi_answer is True:
+        cardinality_hint = "Important: The correct answer includes MORE THAN ONE option. Do NOT assume it is single-choice.\n"
+    elif multi_answer is False:
+        cardinality_hint = "Important: The correct answer is EXACTLY ONE option (single-choice).\n"
+    else:
+        cardinality_hint = ""
 
     if cot_on:
         return (
             "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
+            + cardinality_hint +
             "You SHOULD output your chain-of-thought reasoning.\n"
             "Output format rules (STRICT):\n"
             "- Return ONLY a JSON object. No markdown. No extra text.\n"
@@ -757,6 +1030,7 @@ def build_mcq_prompt(question: str, options: List[str], cot_on: bool) -> str:
 
     return (
         "You will answer a multiple-choice question. Some questions may have multiple correct options.\n"
+        + cardinality_hint +
         "Do NOT output chain-of-thought. Provide only the final answer.\n"
         "Output format rules (STRICT):\n"
         "- Return ONLY a JSON object. No markdown. No extra text.\n"
@@ -882,6 +1156,32 @@ def build_mcq_judge_prompt_minimal(model_answer: str, gold_letters_csv: str) -> 
     )
 
 
+def build_mcq_judge_prompt_from_raw(model_output: str, gold_letters_csv: str) -> str:
+    """
+    Judge prompt for MCQ when the answering-model JSON parsing failed.
+    The judge must extract option letters from the raw model output, then compare to gold set.
+    """
+    return (
+        "You are a strict evaluator for a multiple-choice question. Some questions may have multiple correct options.\n"
+        "Your tasks:\n"
+        "1) Extract the option letters chosen by the model (A-E) from the MODEL OUTPUT.\n"
+        "2) Treat answers as a SET (order-insensitive; duplicates ignored).\n"
+        "3) The answer is correct ONLY IF the extracted set exactly equals the gold set.\n\n"
+        "Return ONLY a JSON object. No markdown, no extra text.\n"
+        "The JSON schema is:\n"
+        "{\n"
+        '  "verdict": "correct" | "incorrect" | "unjudgeable",\n'
+        '  "extracted_answer": string|null,\n'
+        '  "reason": string\n'
+        "}\n"
+        'Notes:\n'
+        '- If you can extract letters, set extracted_answer to a normalized CSV like "A" or "A,B,C" (no spaces).\n'
+        '- If the model does not provide a usable answer, set verdict="unjudgeable".\n\n'
+        f"Gold Answer (letters CSV):\n{gold_letters_csv}\n\n"
+        f"Model Output:\n{model_output}\n"
+    )
+
+
 
 
 
@@ -894,16 +1194,10 @@ def parse_judge_json(text: str) -> Dict[str, Any]:
     """
     text = (text or "").strip()
     try:
-        # Best-effort: some models may wrap JSON with extra text/codefences.
-        candidate = text
-        if "```" in candidate:
-            candidate = re.sub(r"(?s)^```(?:json)?\s*|\s*```$", "", candidate.strip()).strip()
-        if not candidate.startswith("{"):
-            start = candidate.find("{")
-            end = candidate.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                candidate = candidate[start : end + 1]
-
+        # Best-effort: judge may include extra text after JSON; extract the first JSON object.
+        candidate = extract_first_json_object_strict(text) or extract_first_json_object(text)
+        if not candidate:
+            raise ValueError("no_json_object_found")
         judge_json = json.loads(candidate)
 
         # 解析 "verdict" 字段
@@ -969,9 +1263,39 @@ async def eval_one(
 
     gold_raw = str(row.get("Answer", "")).strip()
     gold_norm = normalize_csv_letters(gold_raw) if mcq else gold_raw
+    multi_answer: Optional[bool] = None
+    if mcq and (getattr(run_cfg, "mcq_cardinality_hint", "on") == "on"):
+        try:
+            # Hint the answering model about single-vs-multi answer, without revealing which options or how many.
+            # Uses the gold answer as the source of truth.
+            s = csv_to_set(gold_norm)
+            if len(s) >= 2:
+                multi_answer = True
+            elif len(s) == 1:
+                multi_answer = False
+        except Exception:
+            multi_answer = None
 
-    img_cell = row.get("Image", None)
-    img_dep = int(row.get("Image_Dependency", 0) or 0)
+    def _pick_image_cell(r: Dict[str, Any]) -> Any:
+        # Dataset may provide multiple image columns, e.g. Image / Image.1.
+        for k in ("Image", "Image.1", "Image_1", "Image2", "Image_2"):
+            v = r.get(k, None)
+            if v is None or is_nan(v):
+                continue
+            s = str(v).strip()
+            if s and s.lower() != "nan":
+                return v
+        return r.get("Image", None)
+
+    img_cell = _pick_image_cell(row)
+    # Image_Dependency: supports 0/1/2
+    # - 0: no image dependency (or no image)
+    # - 1: image may help, but do not skip if missing
+    # - 2: image is required; skip if missing
+    try:
+        img_dep = int(row.get("Image_Dependency", 0) or 0)
+    except Exception:
+        img_dep = 0
 
     cot_on = (run_cfg.cot == "on")
 
@@ -982,8 +1306,8 @@ async def eval_one(
     if image_path and os.path.exists(image_path):
         image_data_url = image_file_to_data_url(image_path)
 
-    # Skip if image required but missing
-    if img_dep == 1 and not image_data_url and run_cfg.skip_image_missing:
+    # Skip if image required but missing (dependency level 2)
+    if img_dep >= 2 and not image_data_url and run_cfg.skip_image_missing:
         img_preview = ""
         if img_cell is not None and not is_nan(img_cell):
             img_preview = str(img_cell).strip()
@@ -1009,7 +1333,11 @@ async def eval_one(
         print(f"[{idx}/{total}] id={qid}  SKIP(image missing)  gold={gold_norm}  image={img_preview}", flush=True)
         return out
 
-    base_prompt = build_mcq_prompt(question, options, cot_on=cot_on) if mcq else build_freeform_answer_prompt(question, cot_on=cot_on)
+    base_prompt = (
+        build_mcq_prompt(question, options, cot_on=cot_on, multi_answer=multi_answer)
+        if mcq
+        else build_freeform_answer_prompt(question, cot_on=cot_on)
+    )
 
     async def _answer_once() -> Dict[str, Any]:
         """
@@ -1038,7 +1366,13 @@ async def eval_one(
                 prompt = build_answer_json_retry_prefix(k + 1, answer_parse_error or "unknown") + base_prompt
 
             async with model_sem:
-                model_call = await model_provider.call(prompt=prompt, image_data_url=image_data_url)
+                model_call = await model_provider.call(
+                    prompt=prompt,
+                    image_data_url=image_data_url,
+                    label=f"model id={qid} idx={idx}",
+                    role="model",
+                    reasoning_effort=getattr(run_cfg, "model_reasoning_effort", "off"),
+                )
 
             model_text = extract_text_from_provider_response(
                 model_provider.cfg.provider, (model_call or {}).get("response")
@@ -1064,134 +1398,277 @@ async def eval_one(
             "model_latency_ms": (t1 - t0),
         }
 
-    # ---- Answering model: majority vote over N attempts (N>=1) ----
+    # ---- Majority vote execution model (requested):
+    # If majority_vote=N, run the "vote=1" path sequentially N times.
+    # - Rounds 1..N-1: answering model only; judge fields are empty; print immediately.
+    # - Round N: compute final pred from ALL answers so far, then call judge ONCE; print final with judge.
     vote_n = max(1, int(getattr(run_cfg, "majority_vote", 1) or 1))
-    t0 = now_ms()
     vote_runs: List[Dict[str, Any]] = []
-    for _ in range(vote_n):
+    vote_answers: List[str] = []
+    vote_t0 = now_ms()
+
+    def _preview(s: str) -> str:
+        s2 = (s or "").replace("\n", " ").strip()
+        return (s2[:200] + "...") if len(s2) > 200 else s2
+
+    final_out: Optional[Dict[str, Any]] = None
+
+    for round_idx in range(1, vote_n + 1):
         if run_cfg.cancel_event is not None and run_cfg.cancel_event.is_set():
-            break
-        vote_runs.append(await _answer_once())
-    t1 = now_ms()
+            cancelled_out = {
+                "id": qid,
+                "idx": idx,
+                "total": total,
+                "skipped": True,
+                "skip_reason": "cancelled",
+                "gold_raw": gold_raw,
+                "gold": gold_norm,
+                "pred_raw": None,
+                "pred": None,
+                "answer_json_ok": False,
+                "answer_json_attempts": 0,
+                "answer_json_error": "cancelled",
+                "majority_vote_n": vote_n,
+                "majority_vote_round": round_idx,
+                "majority_vote_is_final": False,
+                "majority_vote_answers": vote_answers,
+                "rule_correct": None,
+                "judge_correct": None,
+                "latency_ms": 0,
+                "judge_latency_ms": None,
+                "total_latency_ms": 0,
+                "question": question,
+                "options": options,
+                "question_type_raw": question_type_raw,
+                "question_type_inferred": "Multiple Choice" if mcq else "Freeform",
+                "image_path": image_path,
+                "image_data_url": image_path if image_path else None,
+                "cot": run_cfg.cot,
+                "model_call": None,
+                "model_text": "",
+                "judge": None,
+                "judge_call": None,
+            }
+            async with write_lock:
+                safe_jsonl_append(results_path, cancelled_out)
+            print(f"[{idx}/{total}] id={qid}  CANCELLED  round={round_idx}/{vote_n}", flush=True)
+            return cancelled_out
 
-    vote_answers = [r.get("answer") for r in vote_runs if r.get("answer")]
-    extracted_final_answer: Optional[str] = majority_vote_pick([str(x) for x in vote_answers])
+        one = await _answer_once()
+        vote_runs.append(one)
+        if one.get("answer"):
+            vote_answers.append(str(one.get("answer")))
 
-    # Winner for logging: first run that matches the final answer, else first run.
-    winner = None
-    for r in vote_runs:
-        if extracted_final_answer and (r.get("answer") == extracted_final_answer):
-            winner = r
-            break
-    if winner is None and vote_runs:
-        winner = vote_runs[0]
+        def _judge_detail(jb: Any) -> str:
+            try:
+                if not isinstance(jb, dict):
+                    return ""
+                jj = jb.get("judge_json")
+                if not isinstance(jj, dict):
+                    return ""
+                verdict = str(jj.get("verdict", "") or "").strip()
+                extracted_norm = str(jj.get("extracted_answer_normalized", "") or "").strip()
+                extracted_raw = jj.get("extracted_answer", None)
+                extracted_raw_s = str(extracted_raw).strip() if isinstance(extracted_raw, str) else ""
+                reason = str(jj.get("reason", "") or "").strip()
+                parts: List[str] = []
+                if verdict:
+                    parts.append(f"verdict={verdict}")
+                if extracted_norm:
+                    parts.append(f"extracted_norm={extracted_norm}")
+                elif extracted_raw_s:
+                    parts.append(f"extracted={extracted_raw_s}")
+                if reason:
+                    parts.append(f"reason={_preview(reason)}")
+                return "  ".join(parts)
+            except Exception:
+                return ""
 
-    model_text = (winner.get("model_text") if isinstance(winner, dict) else "") or ""
-    model_call_log = (winner.get("model_call_log") if isinstance(winner, dict) else None)
-    answer_json_ok = bool(winner.get("answer_json_ok")) if isinstance(winner, dict) else False
-    answer_attempts = int(winner.get("answer_json_attempts") or 0) if isinstance(winner, dict) else 0
-    answer_parse_error = winner.get("answer_json_error") if isinstance(winner, dict) else None
-    rule_correct = None
-    judge_call = None
-    judge_block = None
-    judge_correct = None
-    judge_call_log = None
+        # Rounds 1..N-1: print and log immediately with empty judge.
+        if round_idx < vote_n:
+            out_round = {
+                "id": qid,
+                "idx": idx,
+                "total": total,
+                "skipped": False,
+                "skip_reason": None,
+                "gold_raw": gold_raw,
+                "gold": gold_norm,
+                "pred_raw": one.get("answer"),
+                "pred": one.get("answer"),
+                "answer_json_ok": bool(one.get("answer_json_ok")),
+                "answer_json_attempts": int(one.get("answer_json_attempts") or 0),
+                "answer_json_error": one.get("answer_json_error"),
+                "majority_vote_n": vote_n,
+                "majority_vote_round": round_idx,
+                "majority_vote_is_final": False,
+                "majority_vote_answers": list(vote_answers),
+                "rule_correct": None,
+                "judge_correct": None,
+                "latency_ms": int(one.get("model_latency_ms") or 0),
+                "judge_latency_ms": None,
+                "total_latency_ms": int(one.get("model_latency_ms") or 0),
+                "question": question,
+                "options": options,
+                "question_type_raw": question_type_raw,
+                "question_type_inferred": "Multiple Choice" if mcq else "Freeform",
+                "image_path": image_path,
+                "image_data_url": image_path if image_path else None,
+                "cot": run_cfg.cot,
+                "model_call": one.get("model_call_log"),
+                "model_text": (one.get("model_text") or ""),
+                "judge": None,
+                "judge_call": None,
+            }
+            async with write_lock:
+                safe_jsonl_append(results_path, out_round)
+            # Cost info (OpenRouter only; USD). Accumulators are stored in run_cfg.
+            mc = out_round.get("model_call") if isinstance(out_round, dict) else None
+            m_cost = mc.get("cost_usd") if isinstance(mc, dict) else None
+            m_total = float(getattr(run_cfg, "cost_total_usd_model", 0.0) or 0.0)
+            j_total = float(getattr(run_cfg, "cost_total_usd_judge", 0.0) or 0.0)
+            cost_part = ""
+            if isinstance(m_cost, (int, float)):
+                cost_part = f"  model_cost_usd={float(m_cost):.6f}  totals_usd(model={m_total:.6f},judge={j_total:.6f})"
+            print(
+                f"[{idx}/{total}] id={qid}  ROUND {round_idx}/{vote_n}  mcq={mcq}  gold={gold_norm}  pred={out_round.get('pred')}  judge_correct=  model_ms={out_round.get('latency_ms')}  answers_so_far={vote_answers}{cost_part}",
+                flush=True,
+            )
+            print(f"   model_text: {_preview(out_round.get('model_text') or '')}", flush=True)
+            print("   judge_text: ", flush=True)
+            print("   judge_detail: ", flush=True)
+            continue
 
-    # ALWAYS use judge model for scoring (all question types), but send only minimal content.
-    # - MCQ: send gold + extracted answer ONLY (no question/options)
-    # - Freeform: send question + gold + extracted answer, and strip base64 blobs
-    if judge_provider is not None and extracted_final_answer is not None:
-        if mcq:
-            judge_prompt = build_mcq_judge_prompt_minimal(extracted_final_answer, gold_norm)
+        # Round N: compute final answer from ALL collected answers, then call judge ONCE.
+        extracted_final_answer: Optional[str] = majority_vote_pick([str(x) for x in vote_answers if str(x).strip()])
+        judge_block = None
+        judge_correct: Optional[bool] = None
+        judge_call_log = None
+        judge_latency_ms: Optional[int] = None
+
+        if judge_provider is not None:
+            # Adaptive judging:
+            # - If we have an extracted/voted final answer, judge on that short answer.
+            # - If JSON parsing failed (no extracted answer), fall back to judging from the raw model output.
+            judge_input_kind = "extracted"
+            if mcq:
+                if extracted_final_answer is not None:
+                    judge_prompt = build_mcq_judge_prompt_minimal(extracted_final_answer, gold_norm)
+                else:
+                    judge_input_kind = "raw_model_text"
+                    judge_prompt = build_mcq_judge_prompt_from_raw(strip_base64_payloads(one.get("model_text") or ""), gold_norm)
+            else:
+                q_clean = strip_base64_payloads(question)
+                gold_clean = strip_base64_payloads(gold_raw)
+                if extracted_final_answer is not None:
+                    ans_clean = strip_base64_payloads(extracted_final_answer)
+                else:
+                    judge_input_kind = "raw_model_text"
+                    ans_clean = strip_base64_payloads(one.get("model_text") or "")
+                judge_prompt = build_freeform_judge_prompt(q_clean, ans_clean, gold_clean)
+
+            async with judge_sem:
+                jt0 = now_ms()
+                judge_call = await judge_provider.call(
+                    prompt=judge_prompt,
+                    image_data_url=None,
+                    label=f"judge id={qid} idx={idx}",
+                    role="judge",
+                    reasoning_effort=getattr(run_cfg, "judge_reasoning_effort", "off"),
+                )
+                jt1 = now_ms()
+
+            judge_latency_ms = jt1 - jt0
+            judge_text = extract_text_from_provider_response(judge_provider.cfg.provider, (judge_call or {}).get("response"))
+            judge_call_log = _sanitize_call_for_logging(judge_provider.cfg.provider, judge_call, image_path=None)
+            judge_json = parse_judge_json(judge_text)
+            verdict = str(judge_json.get("verdict", "unjudgeable")).lower()
+            judge_correct = (verdict == "correct")
+
+            extracted = judge_json.get("extracted_answer", None)
+            extracted_norm = normalize_csv_letters(extracted) if isinstance(extracted, str) else ""
+            judge_json["extracted_answer_normalized"] = extracted_norm
+
+            judge_block = {
+                "judge_text": judge_text,
+                "judge_json": judge_json,
+                "judge_latency_ms": judge_latency_ms,
+                "judge_input_kind": judge_input_kind,
+            }
         else:
-            q_clean = strip_base64_payloads(question)
-            gold_clean = strip_base64_payloads(gold_raw)
-            ans_clean = strip_base64_payloads(extracted_final_answer)
-            judge_prompt = build_freeform_judge_prompt(q_clean, ans_clean, gold_clean)
+            # No judge result (e.g., answering JSON failed) => count as incorrect.
+            judge_correct = False
 
-        async with judge_sem:
-            jt0 = now_ms()
-            # IMPORTANT: do NOT send image/base64 to judge
-            judge_call = await judge_provider.call(prompt=judge_prompt, image_data_url=None)
-            jt1 = now_ms()
+        vote_t1 = now_ms()
+        model_wall_ms = vote_t1 - vote_t0
+        total_ms = model_wall_ms + (judge_latency_ms or 0)
 
-        judge_text = extract_text_from_provider_response(judge_provider.cfg.provider, (judge_call or {}).get("response"))
-        judge_call_log = _sanitize_call_for_logging(judge_provider.cfg.provider, judge_call, image_path=None)
-        judge_json = parse_judge_json(judge_text)
-        verdict = str(judge_json.get("verdict", "unjudgeable")).lower()
-        # Metric policy: unjudgeable counts as incorrect.
-        judge_correct = (verdict == "correct")
-
-        extracted = judge_json.get("extracted_answer", None)
-        extracted_norm = normalize_csv_letters(extracted) if isinstance(extracted, str) else ""
-        judge_json["extracted_answer_normalized"] = extracted_norm
-
-        judge_block = {
-            "judge_text": judge_text,
-            "judge_json": judge_json,
-            "judge_latency_ms": jt1 - jt0,
+        final_out = {
+            "id": qid,
+            "idx": idx,
+            "total": total,
+            "skipped": False,
+            "skip_reason": None,
+            "gold_raw": gold_raw,
+            "gold": gold_norm,
+            # Final pred is determined after collecting ALL N answers.
+            "pred_raw": extracted_final_answer,
+            "pred": extracted_final_answer,
+            "answer_json_ok": bool(one.get("answer_json_ok")),
+            "answer_json_attempts": int(one.get("answer_json_attempts") or 0),
+            "answer_json_error": one.get("answer_json_error"),
+            "majority_vote_n": vote_n,
+            "majority_vote_round": round_idx,
+            "majority_vote_is_final": True,
+            "majority_vote_answers": list(vote_answers),
+            "rule_correct": None,
+            "judge_correct": judge_correct,
+            # Keep similar meaning as before: model wall time across the whole vote loop.
+            "latency_ms": model_wall_ms,
+            "judge_latency_ms": judge_latency_ms,
+            "total_latency_ms": total_ms,
+            "question": question,
+            "options": options,
+            "question_type_raw": question_type_raw,
+            "question_type_inferred": "Multiple Choice" if mcq else "Freeform",
+            "image_path": image_path,
+            "image_data_url": image_path if image_path else None,
+            "cot": run_cfg.cot,
+            # For this round's "vote=1 style" visibility, keep the last round's call/text.
+            "model_call": one.get("model_call_log"),
+            "model_text": (one.get("model_text") or ""),
+            "judge": judge_block,
+            "judge_call": judge_call_log,
         }
-    else:
-        # No judge result (e.g., answering JSON failed) => count as incorrect.
-        judge_correct = False
 
-    out = {
-        "id": qid,
-        "idx": idx,
-        "total": total,
-        "skipped": False,
-        "skip_reason": None,
-        "gold_raw": gold_raw,
-        "gold": gold_norm,
-        # Canonical prediction is extracted from answering-model JSON (NOT judge extraction).
-        "pred_raw": extracted_final_answer,
-        "pred": extracted_final_answer,
-        "answer_json_ok": answer_json_ok,
-        "answer_json_attempts": answer_attempts,
-        "answer_json_error": answer_parse_error,
-        "majority_vote_n": vote_n,
-        "majority_vote_answers": vote_answers,
-        "rule_correct": rule_correct,
-        "judge_correct": judge_correct,
-        "latency_ms": t1 - t0,
-        "judge_latency_ms": (judge_block.get("judge_latency_ms") if isinstance(judge_block, dict) else None),
-        "total_latency_ms": (t1 - t0) + (judge_block.get("judge_latency_ms") if isinstance(judge_block, dict) and isinstance(judge_block.get("judge_latency_ms"), int) else 0),
-        "question": question,
-        "options": options,
-        "question_type_raw": question_type_raw,
-        "question_type_inferred": "Multiple Choice" if mcq else "Freeform",
-        "image_path": image_path,
-        # Keep a compact image reference; do NOT log base64.
-        "image_data_url": image_path if image_path else None,
-        "cot": run_cfg.cot,
-        # FULL ARCHIVE:
-        "model_call": model_call_log,
-        "model_text": model_text,
-        "judge": judge_block,
-        "judge_call": judge_call_log,
-    }
+        async with write_lock:
+            safe_jsonl_append(results_path, final_out)
 
-    # IMPORTANT: Always append to the single shared results_path computed in run_eval().
-    async with write_lock:
-        safe_jsonl_append(results_path, out)
+        # Cost info (OpenRouter only; USD). Accumulators are stored in run_cfg.
+        m_call = final_out.get("model_call") if isinstance(final_out, dict) else None
+        j_call = final_out.get("judge_call") if isinstance(final_out, dict) else None
+        m_cost = m_call.get("cost_usd") if isinstance(m_call, dict) else None
+        j_cost = j_call.get("cost_usd") if isinstance(j_call, dict) else None
+        m_total = float(getattr(run_cfg, "cost_total_usd_model", 0.0) or 0.0)
+        j_total = float(getattr(run_cfg, "cost_total_usd_judge", 0.0) or 0.0)
+        cost_part = ""
+        if isinstance(m_cost, (int, float)) or isinstance(j_cost, (int, float)):
+            cost_part = (
+                f"  cost_usd(model={float(m_cost or 0.0):.6f},judge={float(j_cost or 0.0):.6f})"
+                f"  totals_usd(model={m_total:.6f},judge={j_total:.6f})"
+            )
+        print(
+            f"[{idx}/{total}] id={qid}  FINAL {round_idx}/{vote_n}  mcq={mcq}  gold={gold_norm}  pred={extracted_final_answer}  judge_correct={judge_correct}  model_ms={model_wall_ms}  judge_ms={(judge_latency_ms or 0)}  total_ms={total_ms}{cost_part}",
+            flush=True,
+        )
+        print(f"   model_text: {_preview(final_out.get('model_text') or '')}", flush=True)
+        jtxt = (judge_block.get("judge_text") if isinstance(judge_block, dict) else "") or ""
+        print(f"   judge_text: {_preview(jtxt)}", flush=True)
+        print(f"   judge_detail: {_judge_detail(judge_block)}", flush=True)
+        break
 
-    # Print ONLY after both model + judge have completed for this question.
-    # (Per user request: do not print immediately after model finishes.)
-    model_preview = (model_text or "").replace("\n", " ").strip()
-    if len(model_preview) > 200:
-        model_preview = model_preview[:200] + "..."
-    jtxt = (judge_block.get("judge_text") if isinstance(judge_block, dict) else "") or ""
-    judge_preview = jtxt.replace("\n", " ").strip()
-    if len(judge_preview) > 200:
-        judge_preview = judge_preview[:200] + "..."
-
-    print(
-        f"[{idx}/{total}] id={qid}  DONE  mcq={mcq}  gold={gold_norm}  pred={extracted_final_answer}  judge_correct={judge_correct}  model_ms={t1 - t0}  judge_ms={(out.get('judge_latency_ms') or 0)}  total_ms={out.get('total_latency_ms')}",
-        flush=True
-    )
-    print(f"   model_text: {model_preview}", flush=True)
-    print(f"   judge_text: {judge_preview}", flush=True)
-    return out
+    assert final_out is not None
+    return final_out
 
 
 
@@ -1199,13 +1676,16 @@ async def eval_one(
 
 async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optional[ProviderConfig],
              run_cfg: RunConfig) -> None:
+    # out_dir is the base output directory; each run writes into a timestamp subfolder.
     ensure_dir(run_cfg.out_dir)
 
     # 确保文件名中的非法字符被替换
     model_name_safe = re.sub(r'[<>:"/\\|?*]', '_', model_cfg.model)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    results_path = os.path.join(run_cfg.out_dir, f"results_{timestamp}_{model_name_safe}.jsonl")  # Same file for all logs
-    summary_path = os.path.join(run_cfg.out_dir, f"summary_{timestamp}_{model_name_safe}.json")
+    run_dir = os.path.join(run_cfg.out_dir, timestamp)
+    ensure_dir(run_dir)
+    results_path = os.path.join(run_dir, f"results_{timestamp}_{model_name_safe}.jsonl")  # Same file for all logs
+    summary_path = os.path.join(run_dir, f"summary_{timestamp}_{model_name_safe}.json")
 
     if os.path.exists(results_path):
         os.remove(results_path)
@@ -1229,16 +1709,43 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     model_sem = asyncio.Semaphore(run_cfg.model_concurrency)
     judge_sem = asyncio.Semaphore(run_cfg.judge_concurrency)
 
+    # Create tasks so cancellation can stop in-flight work.
     tasks = [
-        eval_one(
-            r, i + 1, total_questions,
-            model_provider, judge_provider, run_cfg,
-            model_sem, judge_sem,
-            write_lock, results_path
+        asyncio.create_task(
+            eval_one(
+                r, i + 1, total_questions,
+                model_provider, judge_provider, run_cfg,
+                model_sem, judge_sem,
+                write_lock, results_path
+            )
         )
         for i, r in enumerate(rows)
     ]
-    results = await asyncio.gather(*tasks)
+
+    results: List[Dict[str, Any]] = []
+    pending = set(tasks)
+    cancelled = False
+    while pending:
+        if run_cfg.cancel_event is not None and run_cfg.cancel_event.is_set():
+            cancelled = True
+            for t in pending:
+                t.cancel()
+            break
+        done, pending = await asyncio.wait(pending, timeout=0.2, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            try:
+                r = await t
+                if isinstance(r, dict):
+                    results.append(r)
+            except asyncio.CancelledError:
+                continue
+            except Exception as e:
+                # Keep going; record an error marker for summary.
+                results.append({"skipped": True, "skip_reason": f"task_error:{type(e).__name__}:{e}"})
+
+    if cancelled:
+        # Drain cancellation to close sockets promptly.
+        await asyncio.gather(*list(pending), return_exceptions=True)
 
     # Final correctness is ALWAYS determined by judge_correct for ALL question types.
     # Metric policy: unjudgeable counts as incorrect.
@@ -1281,25 +1788,39 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
             }
         return out
 
-    # Enrich rows with evaluation fields for downstream grouping / Excel output
-    for result, row in zip(results, rows):
-        row["skipped"] = bool(result.get("skipped"))
-        row["skip_reason"] = result.get("skip_reason")
-        row["question_type_inferred"] = result.get("question_type_inferred")
-        row["answer_json_ok"] = result.get("answer_json_ok")
-        row["answer_json_attempts"] = result.get("answer_json_attempts")
-        row["answer_json_error"] = result.get("answer_json_error")
-        row["pred"] = result.get("pred")
+    # Align results back to question index (tasks complete out-of-order).
+    result_by_idx: Dict[int, Dict[str, Any]] = {}
+    for r in results:
+        try:
+            i = int(r.get("idx") or 0)
+        except Exception:
+            i = 0
+        if i >= 1 and i not in result_by_idx:
+            result_by_idx[i] = r
 
-        if row["skipped"]:
-            row["model_correct"] = None
-            continue
+    # Build a metric-only view of rows (do not mutate the original dataset columns).
+    metric_rows: List[Dict[str, Any]] = []
+    model_correct_list: List[Optional[bool]] = []
+    for i, row in enumerate(rows):
+        res = result_by_idx.get(i + 1) or {}
+        skipped = bool(res.get("skipped"))
+        judge_correct = res.get("judge_correct")
+        if skipped:
+            mc_val: Optional[bool] = None
+        else:
+            # write-back: single source of truth is judge_correct (unjudgeable already mapped to False)
+            mc_val = bool(judge_correct)
 
-        # 写回表格：统一用 judge_correct（True/False），unjudgeable 已计为 False
-        row["model_correct"] = bool(result.get("judge_correct"))
+        model_correct_list.append(mc_val)
+        metric = dict(row)
+        metric["skipped"] = skipped
+        metric["skip_reason"] = res.get("skip_reason")
+        metric["question_type_inferred"] = res.get("question_type_inferred")
+        metric["model_correct"] = mc_val
+        metric_rows.append(metric)
 
-    overall_total = sum(1 for r in rows if not r.get("skipped"))
-    overall_correct = sum(1 for r in rows if (not r.get("skipped")) and r.get("model_correct") is True)
+    overall_total = sum(1 for r in metric_rows if not r.get("skipped"))
+    overall_correct = sum(1 for r in metric_rows if (not r.get("skipped")) and r.get("model_correct") is True)
     overall_incorrect = overall_total - overall_correct
     overall_acc = (overall_correct / overall_total) if overall_total else 0.0
 
@@ -1314,12 +1835,16 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
     # Breakdowns (only if the corresponding column exists in the dataset)
     cols = set(df.columns)
     breakdowns: Dict[str, Any] = {
-        "by_question_type_inferred": _group_breakdown(rows, "question_type_inferred"),
+        "by_question_type_inferred": _group_breakdown(metric_rows, "question_type_inferred"),
     }
-    if "Question_Type" in cols:
-        breakdowns["by_question_type_raw"] = _group_breakdown(rows, "Question_Type")
     if "Image_Dependency" in cols:
-        breakdowns["by_image_dependency"] = _group_breakdown(rows, "Image_Dependency")
+        breakdowns["by_image_dependency"] = _group_breakdown(metric_rows, "Image_Dependency")
+    if "Image_Complexity" in cols:
+        breakdowns["by_image_complexity"] = _group_breakdown(metric_rows, "Image_Complexity")
+    if "Subfield" in cols:
+        breakdowns["by_subfield"] = _group_breakdown(metric_rows, "Subfield")
+    if "Academic_Level" in cols:
+        breakdowns["by_academic_level"] = _group_breakdown(metric_rows, "Academic_Level")
 
     # Best-effort: field/domain and difficulty columns may vary by dataset.
     # We pick the first matching column name in a common candidate list.
@@ -1331,16 +1856,38 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
 
     field_col = _pick_col(["Field", "Domain", "Subject", "领域", "学科", "科目"])
     if field_col:
-        breakdowns["by_field"] = {"column": field_col, "groups": _group_breakdown(rows, field_col)}
+        breakdowns["by_field"] = {"column": field_col, "groups": _group_breakdown(metric_rows, field_col)}
 
     difficulty_col = _pick_col(["Difficulty", "难度", "Level", "Difficult"])
     if difficulty_col:
-        breakdowns["by_difficulty"] = {"column": difficulty_col, "groups": _group_breakdown(rows, difficulty_col)}
+        breakdowns["by_difficulty"] = {"column": difficulty_col, "groups": _group_breakdown(metric_rows, difficulty_col)}
     # =====================================================================
 
-    # Save results to a new Excel file
-    output_df = pd.DataFrame(rows)
-    output_df.to_excel(os.path.join(run_cfg.out_dir, f"evaluated_{timestamp}_{model_name_safe}.xlsx"), index=False)
+    def _print_breakdown(title: str, groups: Dict[str, Any]) -> None:
+        try:
+            items = list(groups.items())
+            items.sort(key=lambda kv: int(kv[1].get("total", 0)), reverse=True)
+            print(f"\n=== Breakdown: {title} ===", flush=True)
+            for name, b in items:
+                total = b.get("total", 0)
+                correct = b.get("correct", 0)
+                incorrect = b.get("incorrect", 0)
+                acc_str = b.get("accuracy_str", "")
+                print(f"- {name}: total={total} correct={correct} incorrect={incorrect} acc={acc_str}", flush=True)
+        except Exception:
+            return
+
+    # Save results to a new Excel file.
+    # Requirement: keep ALL original dataset columns; only add/update `model_correct`.
+    output_df = df.copy()
+    if run_cfg.limit is not None:
+        output_df = output_df.head(int(run_cfg.limit))
+    output_df["model_correct"] = model_correct_list
+    # Robustness: clean illegal control characters that openpyxl rejects.
+    for col in output_df.columns:
+        if output_df[col].dtype == "object":
+            output_df[col] = output_df[col].map(_excel_safe_cell)
+    output_df.to_excel(os.path.join(run_dir, f"evaluated_{timestamp}_{model_name_safe}.xlsx"), index=False)
 
     total = len(results)
     skipped = sum(1 for r in results if r.get("skipped"))
@@ -1365,6 +1912,9 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
         "skipped": skipped,
         "failed_calls": failed,
         "avg_latency_ms": avg_latency,
+        "cancelled": bool(cancelled),
+        "out_dir_base": run_cfg.out_dir,
+        "run_dir": run_dir,
 
         # judge-only metrics (single source of truth)
         "overall": overall,
@@ -1394,6 +1944,13 @@ async def run_eval(df: pd.DataFrame, model_cfg: ProviderConfig, judge_cfg: Optio
 
     print("\n=== Scores ===", flush=True)
     print(f"Overall (accuracy): {overall.get('accuracy_str')}", flush=True)
+    # Requested prints
+    if isinstance(breakdowns.get("by_image_complexity"), dict):
+        _print_breakdown("Image_Complexity", breakdowns["by_image_complexity"])
+    if isinstance(breakdowns.get("by_subfield"), dict):
+        _print_breakdown("Subfield", breakdowns["by_subfield"])
+    if isinstance(breakdowns.get("by_academic_level"), dict):
+        _print_breakdown("Academic_Level", breakdowns["by_academic_level"])
 
     print(f"\nSaved full archives to: {results_path}", flush=True)
     print(f"Saved summary to: {summary_path}", flush=True)
@@ -1434,7 +1991,12 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
     ap.add_argument("--input", type=str, required=False, default="", help="Path to .xlsx dataset.")
     ap.add_argument("--sheet", type=str, default="", help="Sheet name (default: first sheet).")
     ap.add_argument("--images-root", type=str, default="", help="Root directory where 'images/' folder lives.")
-    ap.add_argument("--out-dir", type=str, default=None, help="Output directory (default: from YAML or 'out_run').")
+    ap.add_argument(
+        "--out-dir",
+        type=str,
+        default=None,
+        help="Base output directory. Each run writes into a timestamp subfolder under this dir (default: from YAML or 'out_run').",
+    )
     ap.add_argument("--concurrency", type=int, default=None, help="(legacy) default for both model/judge concurrency")
     ap.add_argument("--model-concurrency", type=int, default=None, help="Max in-flight requests to the answering model")
     ap.add_argument("--judge-concurrency", type=int, default=None, help="Max in-flight requests to the judge model")
@@ -1464,6 +2026,29 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
         type=int,
         default=None,
         help="Call answering model N times per question and take majority answer (default: 1).",
+    )
+
+    ap.add_argument(
+        "--mcq-cardinality-hint",
+        type=str,
+        choices=["on", "off"],
+        default=None,
+        help="MCQ prompt hint: tell the answering model whether the gold answer is single-choice or multi-choice (on/off). Default: on.",
+    )
+
+    ap.add_argument(
+        "--model-reasoning-effort",
+        type=str,
+        choices=["off", "xhigh", "high", "medium", "low", "minimal", "none"],
+        default=None,
+        help="OpenRouter reasoning effort for the answering model. off => do not send reasoning.effort.",
+    )
+    ap.add_argument(
+        "--judge-reasoning-effort",
+        type=str,
+        choices=["off", "xhigh", "high", "medium", "low", "minimal", "none"],
+        default=None,
+        help="OpenRouter reasoning effort for the judge model. off => do not send reasoning.effort.",
     )
 
     # VPN/proxy switch
@@ -1623,10 +2208,26 @@ def cli_main(argv: Optional[List[str]] = None, *, cancel_event: Optional[threadi
             if args.majority_vote is not None
             else cfg.get("majority_vote", 1)
         ),
+        mcq_cardinality_hint=str(
+            args.mcq_cardinality_hint
+            if args.mcq_cardinality_hint is not None
+            else cfg.get("mcq_cardinality_hint", "off")
+        ),
+        model_reasoning_effort=str(
+            args.model_reasoning_effort
+            if args.model_reasoning_effort is not None
+            else cfg.get("model_reasoning_effort", cfg.get("reasoning_effort", "off"))
+        ),
+        judge_reasoning_effort=str(
+            args.judge_reasoning_effort
+            if args.judge_reasoning_effort is not None
+            else cfg.get("judge_reasoning_effort", cfg.get("reasoning_effort", "off"))
+        ),
         vpn=(args.vpn if args.vpn is not None else cfg.get("vpn", "off")),
         proxy=args.proxy or cfg.get("proxy", ""),
     )
-    run_cfg.cancel_event = cancel_event
+    # Always have an event available so we can stop the run on fatal config/parameter issues.
+    run_cfg.cancel_event = cancel_event if cancel_event is not None else threading.Event()
 
     # Read xlsx
     df = pd.read_excel(run_cfg.input_path, sheet_name=run_cfg.sheet_name, engine="openpyxl")
